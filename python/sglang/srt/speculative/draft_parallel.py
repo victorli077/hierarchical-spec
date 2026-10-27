@@ -21,6 +21,7 @@ def legacy_draft_parallel_spec(
     single_group = (
         spec_algorithm.is_eagle3()
         or spec_algorithm.is_dflash()
+        or spec_algorithm.is_hierarchical()
         or (spec_algorithm.is_dspark() and not dspark_is_moe)
     )
     return DraftParallelSpec(
@@ -71,6 +72,6 @@ def resolve_draft_parallel_layout(
 def legacy_draft_attn_tp_size(spec_algorithm: SpeculativeAlgorithm) -> int:
     """Geometry for direct runner callers without a resolved draft worker."""
     parallel = get_parallel()
-    if spec_algorithm.is_dflash():
+    if spec_algorithm.is_dflash() or spec_algorithm.is_hierarchical():
         return getattr(parallel, f"{draft_attn_parallel_group()}_size")
     return parallel.attn_tp_size

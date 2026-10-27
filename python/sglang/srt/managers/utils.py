@@ -61,6 +61,7 @@ class GenerationBatchResult:
     ] = None
     num_correct_drafts: int = 0  # no bonus included
     num_correct_drafts_per_req_cpu: Optional[List[int]] = None
+    proposed_lens: Optional[torch.Tensor] = None
     num_block_accept_tokens: int = 0
     num_cap_tokens: int = 0
     # FDFO dLLM batching: per-request accepted block length and carried algo state.
@@ -202,6 +203,9 @@ class GenerationBatchResult:
 
         if self.accept_lens is not None:
             self.accept_lens = _async_d2h(self.accept_lens)
+
+        if self.proposed_lens is not None:
+            self.proposed_lens = _async_d2h(self.proposed_lens)
 
         if self.block_accept_lens is not None:
             self.block_accept_lens = _async_d2h(self.block_accept_lens)

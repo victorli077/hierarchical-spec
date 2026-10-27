@@ -355,6 +355,7 @@ class ModelRunner:
         draft_model_idx: Optional[int] = None,
         draft_attention_backend: Optional[str] = None,
         load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+        is_auxiliary_target: bool = False,
     ):
         # Parse args
         self.mem_fraction_static = mem_fraction_static
@@ -368,6 +369,7 @@ class ModelRunner:
         self.dist_port = nccl_port
         self.server_args = server_args
         self.is_draft_worker = is_draft_worker
+        self.is_auxiliary_target = is_auxiliary_target
         # The process entry published; a draft runner is not one (it must not
         # clobber the target's config), so only the target checks.
         if not is_draft_worker:
@@ -669,6 +671,7 @@ class ModelRunner:
             sliding_window_size=self.sliding_window_size,
             spec_algorithm=self.spec_algorithm,
             is_draft_worker=self.is_draft_worker,
+            is_auxiliary_target=self.is_auxiliary_target,
             post_capture_kv_active=is_post_capture_kv_active(
                 server_args=self.server_args,
                 is_draft_worker=self.is_draft_worker,

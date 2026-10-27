@@ -342,6 +342,7 @@ class KVCacheConfigurator:
     req_to_token_pool: Optional[ReqToTokenPool]
     token_to_kv_pool_allocator: Optional[BaseTokenToKVPoolAllocator]
     memory_pool_config: Optional[MemoryPoolConfig]
+    is_auxiliary_target: bool = False
     draft_parallel_layout: DraftParallelLayout | None = None
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
     draft_model_idx: Optional[int] = None
@@ -368,6 +369,10 @@ class KVCacheConfigurator:
         if (
             not self.is_draft_worker
             and self.spec_algorithm.is_dflash_family()
+            and (
+                self.spec_algorithm != SpeculativeAlgorithm.HIERARCHICALSPEC
+                or self.is_auxiliary_target
+            )
             and aux.draft_model_config is not None
             and aux.dflash_draft_num_layers is not None
         ):
@@ -466,9 +471,11 @@ class KVCacheConfigurator:
                     "CPU FP8 KV cache requires the intel_amx attention backend."
                 )
 
-        if not self.spec_algorithm.is_none() and self.is_draft_worker:
+        if self.memory_pool_config is not None and (
+            self.is_draft_worker or self.spec_algorithm.is_hierarchical()
+        ):
             assert self.memory_pool_config is not None, (
-                "Draft worker requires memory_pool_config"
+                "Draft and HierarchicalSpec runners require memory_pool_config"
             )
             config = self.memory_pool_config
         else:

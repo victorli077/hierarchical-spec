@@ -40,6 +40,29 @@ class Spec(msgspec.Struct):
             aliases=["--speculative-draft-model"],
         ),
     ] = None
+    speculative_intermediate_model_path: A[
+        Optional[str],
+        Arg(
+            help="Path to the intermediate target/draft model used by HierarchicalSpec.",
+        ),
+    ] = None
+    speculative_intermediate_quantization: A[
+        Optional[str],
+        Arg(
+            help="Quantization format for the HierarchicalSpec intermediate model.",
+            choices=QUANTIZATION_CHOICES,
+        ),
+    ] = None
+    speculative_cascade_rounds: A[
+        int,
+        Arg(help="Number of A->B refinement rounds for HierarchicalSpec."),
+    ] = 3
+    speculative_cascade_device_map: A[
+        Optional[str],
+        Arg(
+            help="Fixed device map for HierarchicalSpec, e.g. A:0,B:1,C:2.",
+        ),
+    ] = None
     speculative_boundary_reduction: A[
         Literal["ar", "rs", "rsv", "rs+rsv"],
         Arg(no_cli=True, resolvable=True),
@@ -69,7 +92,8 @@ class Spec(msgspec.Struct):
     ] = None
     speculative_dflash_block_size: A[
         Optional[int],
-        "DFLASH only. Block size (verify window length). Alias of --speculative-num-draft-tokens for DFLASH.",
+        "DFLASH block size (verify window length), also used as the inner A-to-B "
+        "block size by HierarchicalSpec. Alias of --speculative-num-draft-tokens.",
     ] = None
     speculative_domino_candidate_pool_size: A[
         int,

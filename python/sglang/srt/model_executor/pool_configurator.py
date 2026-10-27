@@ -107,7 +107,14 @@ logger = logging.getLogger(__name__)
 def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     """Bytes/token the DFLASH draft KV pool adds, 0 if none; replicated across DCP
     ranks because the draft pool spans the widened virtual location space."""
-    if kvc.is_draft_worker or not kvc.spec_algorithm.is_dflash_family():
+    if (
+        kvc.is_draft_worker
+        or not kvc.spec_algorithm.is_dflash_family()
+        or (
+            getattr(kvc.spec_algorithm, "name", None) == "HIERARCHICALSPEC"
+            and not kvc.is_auxiliary_target
+        )
+    ):
         return 0
     cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
@@ -311,7 +318,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         # DFLASH/DSPARK: the draft's per-token KV cost can differ from the target's
         # (e.g. MLA target, per-head K/V draft), so size from the draft config.
-        if kvc.spec_algorithm.is_dflash_family() and not kvc.is_draft_worker:
+        if (
+            kvc.spec_algorithm.is_dflash_family()
+            and not kvc.is_draft_worker
+            and (
+                getattr(kvc.spec_algorithm, "name", None) != "HIERARCHICALSPEC"
+                or kvc.is_auxiliary_target
+            )
+        ):
             from sglang.srt.speculative.dflash_utils import (
                 scale_kv_cell_size_per_token_for_dflash,
             )

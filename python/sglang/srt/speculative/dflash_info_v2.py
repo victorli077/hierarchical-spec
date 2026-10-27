@@ -140,6 +140,15 @@ class DFlashDraftInputV2(SpecInput):
 
         # For DFLASH, each decode step needs a fixed-size verify block.
         block_size = int(get_spec().speculative_num_draft_tokens)
+        algorithm = str(get_spec().speculative_algorithm or "").upper()
+        if algorithm == "HIERARCHICALSPEC":
+            from sglang.srt.speculative.hierarchical_config import (
+                cascade_verify_width,
+            )
+
+            block_size = cascade_verify_width(
+                block_size, int(get_spec().speculative_cascade_rounds)
+            )
         if block_size <= 0:
             raise ValueError(
                 f"DFLASH invalid speculative_num_draft_tokens={block_size}."

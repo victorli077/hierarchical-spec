@@ -915,6 +915,7 @@ class ModelConfig:
         model_revision: str = None,
         is_draft_model: bool = False,
         context_length: Optional[int] = None,
+        quantization_override: Optional[str] = None,
         **kwargs,
     ):
         for record_type in type(server_args).__mro__:
@@ -931,7 +932,9 @@ class ModelConfig:
 
         cfg = resolving_view(server_args)
         quantization = (
-            cfg.speculative_draft_model_quantization
+            quantization_override
+            if quantization_override is not None
+            else cfg.speculative_draft_model_quantization
             if is_draft_model
             else cfg.quantization
         )

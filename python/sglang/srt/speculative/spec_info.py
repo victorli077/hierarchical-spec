@@ -44,6 +44,7 @@ class SpeculativeAlgorithm(Enum):
     FROZEN_KV_MTP = auto()
     STANDALONE = auto()
     NGRAM = auto()
+    HIERARCHICALSPEC = auto()
     NONE = auto()
 
     @classmethod
@@ -124,13 +125,16 @@ class SpeculativeAlgorithm(Enum):
         return self == SpeculativeAlgorithm.DSPARK
 
     def is_dflash_family(self) -> bool:
-        return self.is_dflash() or self.is_dspark()
+        return self.is_dflash() or self.is_dspark() or self.is_hierarchical()
 
     def is_standalone(self) -> bool:
         return self == SpeculativeAlgorithm.STANDALONE
 
     def is_ngram(self) -> bool:
         return self == SpeculativeAlgorithm.NGRAM
+
+    def is_hierarchical(self) -> bool:
+        return self == SpeculativeAlgorithm.HIERARCHICALSPEC
 
     def supports_target_verify_for_draft(self) -> bool:
         return self.is_dflash_family()
@@ -169,7 +173,12 @@ class SpeculativeAlgorithm(Enum):
         # Needs a GPU draft phase to hide the grammar CPU work under: NGRAM drafts
         # from a host corpus lookup, so it stays synchronous by design.
         # STANDALONE inherits the EAGLE V2 worker's verify path, barrier included.
-        return self.is_eagle() or self.is_standalone() or self.is_dflash_family()
+        return (
+            self.is_eagle()
+            or self.is_standalone()
+            or self.is_dflash()
+            or self.is_dspark()
+        )
 
     def has_draft_kv(self) -> bool:
         """Whether the draft phase writes KV chains. NGRAM does not (its tree
@@ -274,6 +283,15 @@ class SpeculativeAlgorithm(Enum):
         cfg = resolving_view(server_args)
         if cfg.speculative_num_draft_tokens is None:
             return None
+        if self.is_hierarchical():
+            from sglang.srt.speculative.hierarchical_config import (
+                cascade_verify_width,
+            )
+
+            return cascade_verify_width(
+                int(cfg.speculative_num_draft_tokens),
+                int(cfg.speculative_cascade_rounds),
+            )
         if not cfg.speculative_adaptive:
             return cfg.speculative_num_draft_tokens
 
@@ -370,6 +388,10 @@ class SpeculativeAlgorithm(Enum):
             from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
             return NGRAMWorker
+        elif self.is_hierarchical():
+            from sglang.srt.speculative.hierarchical_worker import HierarchicalSpecWorker
+
+            return HierarchicalSpecWorker
 
         raise ValueError("Unreachable code path in create_worker.")
 

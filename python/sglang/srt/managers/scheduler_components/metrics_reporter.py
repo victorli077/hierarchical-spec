@@ -291,6 +291,7 @@ class SchedulerMetricsReporter:
         # `*_correct_drafts` counts accepted draft proposals only.
         self.spec_num_accept_tokens = 0  # per-log-interval
         self.spec_num_correct_drafts = 0
+        self.spec_num_proposed_drafts = 0
         self.spec_num_forward_ct = 0
         self.spec_total_num_accept_tokens = 0  # lifetime
         self.spec_total_num_forward_ct = 0
@@ -542,11 +543,14 @@ class SchedulerMetricsReporter:
         bs: int,
         num_correct_drafts: int,
         num_accept_tokens: int,
+        num_proposed_drafts: Optional[int] = None,
         num_block_accept_tokens: int = 0,
         num_cap_tokens: int = 0,
     ):
         self.spec_num_accept_tokens += num_accept_tokens
         self.spec_num_correct_drafts += num_correct_drafts
+        if num_proposed_drafts is not None:
+            self.spec_num_proposed_drafts += num_proposed_drafts
         self.spec_num_forward_ct += bs
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
@@ -969,11 +973,14 @@ class SchedulerMetricsReporter:
         else:
             spec_accept_length = self.spec_num_accept_tokens / self.spec_num_forward_ct
             num_correct_drafts = self.spec_num_correct_drafts
-            if get_spec().speculative_num_draft_tokens:
+            if self.spec_num_proposed_drafts:
+                total_draft_tokens = self.spec_num_proposed_drafts
+            elif get_spec().speculative_num_draft_tokens:
                 draft_per_round = get_spec().speculative_num_draft_tokens - 1
+                total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             else:
                 draft_per_round = get_spec().speculative_num_steps or 0
-            total_draft_tokens = self.spec_num_forward_ct * draft_per_round
+                total_draft_tokens = self.spec_num_forward_ct * draft_per_round
             spec_accept_rate = (
                 num_correct_drafts / total_draft_tokens if total_draft_tokens > 0 else 0
             )
@@ -996,6 +1003,7 @@ class SchedulerMetricsReporter:
             self.spec_total_num_accept_tokens += self.spec_num_accept_tokens
             self.spec_total_num_forward_ct += self.spec_num_forward_ct
             self.spec_num_accept_tokens = self.spec_num_correct_drafts = 0
+            self.spec_num_proposed_drafts = 0
             self.spec_num_forward_ct = 0
             self.spec_num_block_accept_tokens = 0
             self.spec_num_cap_tokens = 0

@@ -3153,8 +3153,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             and len(recv_obj.spec_num_correct_drafts) > i
         ):
             # Total number of proposed draft tokens per request.
-            num_proposed_drafts = recv_obj.spec_verify_ct[i] * (
-                get_spec().speculative_num_draft_tokens - 1
+            proposed = getattr(recv_obj, "spec_num_proposed_drafts", None)
+            num_proposed_drafts = (
+                proposed[i]
+                if proposed is not None and len(proposed) > i and proposed[i] > 0
+                else recv_obj.spec_verify_ct[i]
+                * (get_spec().speculative_num_draft_tokens - 1)
             )
             num_correct_drafts = recv_obj.spec_num_correct_drafts[i]
 

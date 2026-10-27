@@ -610,6 +610,11 @@ class Scheduler(
         )
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        if self.spec_algorithm.is_hierarchical():
+            # HierarchicalSpec owns a second target-style cache namespace for
+            # B. It must be constructed after B's private pool is allocated and
+            # must never be attached as a target draft sidecar to C.
+            self.draft_worker.init_intermediate_cache(page_size=self.page_size)
         if self.enable_hierarchical_cache:
             cache_controller = self.tree_cache.cache_controller
             if cache_controller is not None:
@@ -1082,13 +1087,22 @@ class Scheduler(
         preloaded_weights_bytes = self.tp_worker.preloaded_weights_bytes
         if self.draft_worker is not None:
             preloaded_weights_bytes += self.draft_worker.preloaded_weights_bytes
-        self.tp_worker.model_runner.account_preloaded_weights(preloaded_weights_bytes)
+        memory_pool_config = None
+        if self.spec_algorithm.is_hierarchical():
+            memory_pool_config = self.draft_worker.plan_memory_pool_configs(
+                preloaded_weights_bytes=preloaded_weights_bytes
+            )
+        else:
+            self.tp_worker.model_runner.account_preloaded_weights(
+                preloaded_weights_bytes
+            )
         self.tp_worker.alloc_memory_pool(
+            memory_pool_config=memory_pool_config,
             draft_parallel_layout=(
                 self.draft_worker.draft_parallel_layout
                 if self.draft_worker is not None
                 else None
-            )
+            ),
         )
 
     def init_memory_pools(self):
@@ -3124,6 +3138,18 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if self.spec_algorithm.is_hierarchical():
+            from sglang.srt.speculative.hierarchical_config import (
+                validate_hierarchical_request,
+            )
+
+            error_msg = validate_hierarchical_request(req)
+            if error_msg is not None:
+                req.set_finish_with_abort(error_msg)
+                self.init_req_max_new_tokens(req)
+                self._add_request_to_queue(req)
+                return
+
         if self.spec_algorithm.is_uno():
             error_msg = validate_uno_request(req)
             if error_msg is not None:
@@ -3519,6 +3545,8 @@ class Scheduler(
 
     def _release_aborted_request(self, req: Req) -> None:
         """Drop the cache-side state an aborted request left behind."""
+        if isinstance(self.draft_worker, BaseSpecWorker):
+            self.draft_worker.note_request_aborted(rid=req.rid)
         req.release_mm_inputs_on_abort()
         self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
         if req.session is not None and req.session.streaming:
@@ -4466,6 +4494,9 @@ class Scheduler(
                 else None
             )
             retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            if isinstance(self.draft_worker, BaseSpecWorker):
+                for req in (*retracted_reqs, *reqs_to_abort):
+                    self.draft_worker.note_request_retracted(rid=req.rid)
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (

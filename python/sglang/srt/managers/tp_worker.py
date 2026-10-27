@@ -294,6 +294,10 @@ class TpModelWorker(BaseTpWorker):
         draft_attention_backend: Optional[str] = None,
         random_seed: Optional[int] = None,
         load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+        model_path_override: Optional[str] = None,
+        model_revision_override: Optional[str] = None,
+        quantization_override: Optional[str] = None,
+        is_auxiliary_target: bool = False,
     ):
         # Parse args
         self.server_args = server_args
@@ -311,6 +315,10 @@ class TpModelWorker(BaseTpWorker):
         self.context_length = context_length
         # Draft worker: the attention backend the algorithm resolved for it.
         self.draft_attention_backend = draft_attention_backend
+        self.model_path_override = model_path_override
+        self.model_revision_override = model_revision_override
+        self.quantization_override = quantization_override
+        self.is_auxiliary_target = is_auxiliary_target
 
         # MTP model runners
         self.model_runner_list: List[ModelRunner] = []
@@ -323,7 +331,11 @@ class TpModelWorker(BaseTpWorker):
 
         self._init_dllm_algorithm()
 
-        if get_serving().skip_tokenizer_init or self.is_draft_worker:
+        if (
+            get_serving().skip_tokenizer_init
+            or self.is_draft_worker
+            or self.is_auxiliary_target
+        ):
             # A draft worker's tokenizer would only duplicate the target's:
             # tokenizer_path always points at the target model.
             self.tokenizer = self.processor = None
@@ -468,17 +480,22 @@ class TpModelWorker(BaseTpWorker):
         self.model_config = ModelConfig.from_server_args(
             self.server_args,
             model_path=(
-                get_model().model_path
+                self.model_path_override
+                if self.model_path_override is not None
+                else get_model().model_path
                 if not self.is_draft_worker
                 else get_spec().speculative_draft_model_path
             ),
             model_revision=(
-                get_model().revision
+                self.model_revision_override
+                if self.model_revision_override is not None
+                else get_model().revision
                 if not self.is_draft_worker
                 else get_spec().speculative_draft_model_revision
             ),
             is_draft_model=self.is_draft_worker,
             context_length=self.context_length,
+            quantization_override=self.quantization_override,
         )
 
     def _init_model_runner(self):
@@ -497,6 +514,7 @@ class TpModelWorker(BaseTpWorker):
             draft_attention_backend=self.draft_attention_backend,
             draft_model_idx=0 if self.is_multi_layer_eagle else None,
             load_group=self.load_group,
+            is_auxiliary_target=self.is_auxiliary_target,
         )
 
     def _init_multi_layer_eagle_model_runners(self):
@@ -518,6 +536,7 @@ class TpModelWorker(BaseTpWorker):
                     draft_attention_backend=self.draft_attention_backend,
                     draft_model_idx=i,
                     load_group=self.load_group,
+                    is_auxiliary_target=self.is_auxiliary_target,
                 )
             )
 

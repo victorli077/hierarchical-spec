@@ -394,6 +394,23 @@ class BaseSpecWorker(ABC):
         """
         pass
 
+    def note_request_retracted(self, *, rid: str) -> None:
+        """Release algorithm-private request state after scheduler preemption.
+
+        Workers whose provisional state aliases the target cache need no work.
+        A worker with an independent cache namespace must override this hook.
+        """
+        pass
+
+    def note_request_aborted(self, *, rid: str) -> None:
+        """Release algorithm-private state on an out-of-band request abort.
+
+        Running requests normally reach ``note_request_finished`` after their
+        in-flight forward drains. Chunked-prefill and queued aborts can release
+        target KV immediately, so independent cache namespaces need this hook.
+        """
+        pass
+
     def activate_step_by_batch(self, batch_size: int) -> None:
         """Activate the optimal adaptive step for the current batch size.
 

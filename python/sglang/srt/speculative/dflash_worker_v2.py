@@ -2333,6 +2333,39 @@ class DFlashWorkerV2(BaseSpecWorker):
     ) -> DFlashDraftInputV2:
         return make_draft_input_v2(bonus_tokens=bonus_tokens, new_seq_lens=new_seq_lens)
 
+    def forward_provisional(
+        self,
+        batch: ScheduleBatch,
+        *,
+        grammar_barrier=None,
+        pp_proxy_tensors=None,
+    ) -> GenerationBatchResult:
+        """Run one DFlash round without publishing a scheduler commit.
+
+        This is the native A -> auxiliary-target execution entry point used by
+        hierarchical speculation. It intentionally has no ``on_publish``
+        argument: the returned tokens and lengths remain provisional until an
+        outer target verifies them. The caller must provide a batch translated
+        into the auxiliary target's request rows and KV slot namespace.
+        """
+        # prepare_for_verify() changes the batch phase to TARGET_VERIFY in-place.
+        # A normal DFlash request gets a fresh scheduler batch on its next step,
+        # while the cascade deliberately reuses this B-local view for K rounds.
+        # Preserve the caller-owned phase so the next provisional round remains
+        # a decode instead of being mistaken for a target prefill.
+        forward_mode = batch.forward_mode
+        is_extend_in_batch = batch.is_extend_in_batch
+        try:
+            return self.forward_batch_generation(
+                batch,
+                on_publish=None,
+                grammar_barrier=grammar_barrier,
+                pp_proxy_tensors=pp_proxy_tensors,
+            )
+        finally:
+            batch.forward_mode = forward_mode
+            batch.is_extend_in_batch = is_extend_in_batch
+
     def forward_batch_generation(
         self,
         batch: ScheduleBatch,

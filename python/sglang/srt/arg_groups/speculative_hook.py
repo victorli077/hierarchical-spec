@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 from typing import TYPE_CHECKING, Optional
@@ -157,6 +158,9 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             kwargs=kwargs,
         ),
     )
+
+    if (cfg.speculative_algorithm or "").upper() == "HIERARCHICALSPEC":
+        _handle_hierarchical(server_args)
 
     # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
     # EAGLE/NEXTN to FROZEN_KV_MTP.
@@ -1221,6 +1225,119 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             f"{_PAGE_TREE_SPEC_BACKENDS}; got attention_backend="
             f"{view.attention_backend!r}. Use page_size == 1 or one of those backends."
         )
+
+
+def _handle_hierarchical(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.pp_size != 1:
+        raise ValueError("HierarchicalSpec v1 requires pp_size == 1.")
+    if cfg.page_size != 1:
+        raise ValueError("HierarchicalSpec v1 requires --page-size 1.")
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "HierarchicalSpec v1 does not support --enable-unified-memory."
+        )
+    if cfg.speculative_cascade_device_map is not None:
+        if cfg.tp_size != 1:
+            raise ValueError(
+                "HierarchicalSpec v1 device-map syntax is only supported with tp_size=1."
+            )
+        import torch
+        from sglang.srt.speculative.hierarchical_config import parse_device_map
+
+        device_map = parse_device_map(
+            cfg.speculative_cascade_device_map,
+            device_count=torch.cuda.device_count() if cfg.device == "cuda" else None,
+        )
+        if len(set(device_map.values())) != 1 or len(device_map["A"]) != 1:
+            raise ValueError(
+                "HierarchicalSpec v1 currently requires A/B/C on the same GPU; "
+                "independent stage placement is not implemented yet."
+            )
+        if device_map["A"][0] != cfg.base_gpu_id:
+            raise ValueError(
+                "HierarchicalSpec v1 stage device must match --base-gpu-id; "
+                f"got stage GPU {device_map['A'][0]} and base GPU {cfg.base_gpu_id}."
+            )
+    if cfg.speculative_intermediate_model_path is None:
+        raise ValueError(
+            "HierarchicalSpec requires --speculative-intermediate-model-path."
+        )
+    if cfg.speculative_draft_model_path is None:
+        raise ValueError(
+            "HierarchicalSpec requires --speculative-draft-model-path for Domino A."
+        )
+    if cfg.speculative_cascade_rounds <= 0:
+        raise ValueError("--speculative-cascade-rounds must be positive.")
+    # HierarchicalSpec reuses DFlash only for its inner A -> B kernel, so the
+    # public DFlash block-size flag must be resolved onto the field consumed by
+    # DFlashWorkerV2.  Without this alias the worker silently used the default
+    # width of four regardless of --speculative-dflash-block-size.
+    if cfg.speculative_dflash_block_size is not None:
+        block_size = int(cfg.speculative_dflash_block_size)
+        if block_size <= 0:
+            raise ValueError(
+                "HierarchicalSpec requires --speculative-dflash-block-size to be "
+                f"positive, got {cfg.speculative_dflash_block_size}."
+            )
+        if cfg.speculative_num_draft_tokens is not None and int(
+            cfg.speculative_num_draft_tokens
+        ) != block_size:
+            raise ValueError(
+                "Both --speculative-num-draft-tokens and "
+                "--speculative-dflash-block-size are set but they differ. "
+                "For HierarchicalSpec they must match. "
+                f"speculative_num_draft_tokens={cfg.speculative_num_draft_tokens}, "
+                f"speculative_dflash_block_size={cfg.speculative_dflash_block_size}."
+            )
+        declare_resolution(
+            server_args,
+            "_handle_hierarchical",
+            speculative_num_draft_tokens=block_size,
+        )
+    elif cfg.speculative_num_draft_tokens is None:
+        declare_resolution(
+            server_args,
+            "_handle_hierarchical",
+            speculative_num_draft_tokens=4,
+        )
+    if cfg.speculative_num_steps not in (None, 1):
+        raise ValueError(
+            "HierarchicalSpec does not use --speculative-num-steps; use "
+            "--speculative-cascade-rounds instead."
+        )
+    if cfg.attention_backend != "flashinfer":
+        logger.warning(
+            "HierarchicalSpec v1 overrides attention_backend=%r with "
+            "flashinfer; the B forced-token TARGET_VERIFY path does not yet "
+            "support other attention backends.",
+            cfg.attention_backend,
+        )
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
+    cuda_graph_config.decode.backend = Backend.DISABLED
+    cuda_graph_config.prefill.backend = Backend.DISABLED
+    declare_resolution(
+        server_args,
+        "_handle_hierarchical",
+        speculative_num_steps=1,
+        disable_overlap_schedule=True,
+        # A -> B uses the native DFlash width while B -> C uses the wider
+        # 1 + K*L verify shape. V1 deliberately stays eager until separate
+        # graph capture contracts exist for both runners.
+        disable_cuda_graph=True,
+        disable_decode_cuda_graph=True,
+        disable_prefill_cuda_graph=True,
+        cuda_graph_config=cuda_graph_config,
+        enable_mixed_chunk=False,
+        speculative_eagle_topk=1,
+        speculative_use_rejection_sampling=False,
+        # The B forced-token materialization path currently relies on the
+        # FlashInfer TARGET_VERIFY metadata contract. Resolve auto explicitly
+        # so unsupported FA3 hosts fail neither warmup nor a live request.
+        attention_backend="flashinfer",
+    )
 
 
 def _handle_ngram(server_args: ServerArgs) -> None:

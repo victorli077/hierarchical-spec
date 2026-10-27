@@ -32,6 +32,7 @@ def handle_model_source_paths(server_args: Any):
         cfg.model_path,
         cfg.tokenizer_path,
         cfg.speculative_draft_model_path,
+        cfg.speculative_intermediate_model_path,
     ):
         if (
             model_path is not None
@@ -156,6 +157,14 @@ def handle_modelscope_paths(server_args: Any):
             speculative_draft_model_path=_resolve_or_download(
                 cfg.speculative_draft_model_path,
                 revision=cfg.speculative_draft_model_revision or "main",
+            ),
+        )
+    if cfg.speculative_intermediate_model_path:
+        declare_resolution(
+            server_args,
+            "_handle_modelscope_paths",
+            speculative_intermediate_model_path=_resolve_or_download(
+                cfg.speculative_intermediate_model_path, revision="main"
             ),
         )
 

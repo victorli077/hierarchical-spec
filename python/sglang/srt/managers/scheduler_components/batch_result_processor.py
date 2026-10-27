@@ -782,6 +782,11 @@ class SchedulerBatchResultProcessor:
             length - num_non_draft for length in accept_lens
         ]
         result.num_correct_drafts = sum(result.num_correct_drafts_per_req_cpu)
+        proposed_lens = (
+            result.proposed_lens.tolist()
+            if result.proposed_lens is not None
+            else None
+        )
 
         block_accept_lens = (
             result.block_accept_lens.tolist()
@@ -829,6 +834,8 @@ class SchedulerBatchResultProcessor:
 
                 num_correct_drafts = result.num_correct_drafts_per_req_cpu[i]
                 req.spec_num_correct_drafts += num_correct_drafts
+                if proposed_lens is not None:
+                    req.spec_num_proposed_drafts += proposed_lens[i]
                 req.update_spec_correct_drafts_histogram(num_correct_drafts)
 
                 if block_accept_lens is not None:
@@ -979,6 +986,11 @@ class SchedulerBatchResultProcessor:
                 batch_size,
                 result.num_correct_drafts,
                 num_accept_tokens=num_generated_tokens,
+                num_proposed_drafts=(
+                    sum(result.proposed_lens.tolist())
+                    if result.proposed_lens is not None
+                    else None
+                ),
                 num_block_accept_tokens=result.num_block_accept_tokens,
                 num_cap_tokens=result.num_cap_tokens,
             )
