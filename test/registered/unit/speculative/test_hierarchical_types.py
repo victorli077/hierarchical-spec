@@ -1,7 +1,8 @@
 from types import SimpleNamespace
 
-import torch
 import pytest
+import torch
+
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _handle_hierarchical
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
@@ -18,11 +19,21 @@ from sglang.srt.speculative.hierarchical_types import (
     append_pending_round_,
     greedy_anchor_block_accept,
     greedy_block_verify,
+    pending_lens_for_b_round,
+    should_run_b_verify,
 )
 from sglang.srt.speculative.hierarchical_worker import (
     CascadeCoordinator as RuntimeCascadeCoordinator,
-    IntermediateStage,
 )
+from sglang.srt.speculative.hierarchical_worker import (
+    HierarchicalSpecWorker,
+    IntermediateStage,
+    _validate_hierarchical_kv_copy_strides,
+)
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _state(batch=2, width=4):
@@ -116,6 +127,79 @@ def test_ragged_round_accumulation_is_contiguous_and_drops_padding():
     assert storage[2, :5].tolist() == [92, 5, 6, 11, 12]
 
 
+def test_only_final_b_round_drops_its_bonus():
+    commit_lens = torch.tensor([4, 2, 1], dtype=torch.int64)
+    assert pending_lens_for_b_round(commit_lens, is_final_round=False).tolist() == [
+        4,
+        2,
+        1,
+    ]
+    assert pending_lens_for_b_round(commit_lens, is_final_round=True).tolist() == [
+        3,
+        1,
+        0,
+    ]
+
+
+def test_c_to_b_handoff_runs_only_k_minus_one_b_verifies():
+    assert [
+        should_run_b_verify(i, rounds=3, use_c_to_b_kv_handoff=True) for i in range(3)
+    ] == [True, True, False]
+    assert [
+        should_run_b_verify(i, rounds=3, use_c_to_b_kv_handoff=False) for i in range(3)
+    ] == [True, True, True]
+    assert not should_run_b_verify(0, rounds=1, use_c_to_b_kv_handoff=True)
+    with pytest.raises(ValueError, match="round_index"):
+        should_run_b_verify(3, rounds=3, use_c_to_b_kv_handoff=True)
+
+
+def test_c_to_b_kv_copy_requires_identical_row_strides():
+    """A layout mismatch must fail before launching a cross-pool copy kernel."""
+    strides = torch.tensor([128, 256], dtype=torch.int64)
+    _validate_hierarchical_kv_copy_strides(strides, strides.clone())
+    with pytest.raises(RuntimeError, match="identical K/V row strides"):
+        _validate_hierarchical_kv_copy_strides(
+            strides, torch.tensor([128, 512], dtype=torch.int64)
+        )
+
+
+class TestHierarchicalKvCopyMetadata(CustomTestCase):
+    def test_resolves_kv_pool_through_allocator(self):
+        def make_worker():
+            k_buffer = [torch.zeros((4, 2), dtype=torch.bfloat16)]
+            v_buffer = [torch.zeros((4, 2), dtype=torch.bfloat16)]
+            kv_pool = SimpleNamespace(
+                k_buffer=k_buffer,
+                v_buffer=v_buffer,
+                k_data_ptrs=torch.tensor([k_buffer[0].data_ptr()], dtype=torch.uint64),
+                v_data_ptrs=torch.tensor([v_buffer[0].data_ptr()], dtype=torch.uint64),
+                kv_cache_layout="nhd",
+                is_quantized_kv_cache=False,
+            )
+            allocator = SimpleNamespace(get_kvcache=lambda: kv_pool)
+            request_pool = object()
+            return (
+                SimpleNamespace(
+                    get_memory_pool=lambda: (request_pool, allocator),
+                ),
+                kv_pool,
+            )
+
+        target_worker, c_pool = make_worker()
+        intermediate_worker, b_pool = make_worker()
+        worker = object.__new__(HierarchicalSpecWorker)
+        worker.target_worker = target_worker
+        worker.coordinator = SimpleNamespace(
+            intermediate_stage=SimpleNamespace(worker=intermediate_worker)
+        )
+
+        metadata = worker._build_c_to_b_kv_copy_metadata()
+
+        self.assertEqual(metadata["src_ptrs"][0].item(), c_pool.k_buffer[0].data_ptr())
+        self.assertEqual(metadata["dst_ptrs"][0].item(), b_pool.k_buffer[0].data_ptr())
+        self.assertEqual(metadata["row_bytes"], 4)
+
+
 def test_coordinator_commit_clears_rejected_suffix_and_resyncs_all_stages():
     state = _state()
     state.pending_token_ids.copy_(torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]))
@@ -142,11 +226,14 @@ def test_device_map_requires_all_stages():
     assert parse_device_map("A:0,B:1;2,C:3")["B"] == (1, 2)
 
 
-def test_cascade_width_counts_each_b_recovery_as_pending():
-    # L includes the A->B anchor. The round publishes at most L-1 accepted A
-    # proposals plus one B recovery, so K rounds contribute K*L tokens to C.
-    assert cascade_pending_width(inner_block_size=4, rounds=3) == 12
-    assert cascade_verify_width(inner_block_size=4, rounds=3) == 13
+def test_cascade_width_drops_only_final_b_bonus():
+    # Each non-final round contributes L-1 A proposals plus its B bonus. The
+    # final round contributes only L-1 A proposals, while C supplies the final
+    # bonus. C's anchor makes its verify width exactly K*L.
+    assert cascade_pending_width(inner_block_size=4, rounds=3) == 11
+    assert cascade_verify_width(inner_block_size=4, rounds=3) == 12
+    assert cascade_pending_width(inner_block_size=4, rounds=1) == 3
+    assert cascade_verify_width(inner_block_size=4, rounds=1) == 4
 
 
 def _hierarchical_server_args(**overrides):
@@ -167,10 +254,13 @@ def test_hierarchical_dflash_block_size_reaches_worker_field():
     args = _hierarchical_server_args(speculative_dflash_block_size=8)
     _handle_hierarchical(args)
     assert resolution_result(args, "speculative_num_draft_tokens") == 8
-    assert cascade_verify_width(
-        resolution_result(args, "speculative_num_draft_tokens"),
-        resolution_result(args, "speculative_cascade_rounds"),
-    ) == 25
+    assert (
+        cascade_verify_width(
+            resolution_result(args, "speculative_num_draft_tokens"),
+            resolution_result(args, "speculative_cascade_rounds"),
+        )
+        == 24
+    )
 
 
 def test_hierarchical_dflash_block_size_defaults_and_rejects_conflict():
@@ -357,10 +447,14 @@ def test_runtime_coordinator_owns_b_and_checks_kernel_injection():
         target_worker=SimpleNamespace(), draft_worker=draft_worker
     )
     try:
-        RuntimeCascadeCoordinator(
-            intermediate_stage=stage, inner_kernel=wrong_kernel
-        )
+        RuntimeCascadeCoordinator(intermediate_stage=stage, inner_kernel=wrong_kernel)
     except ValueError as exc:
         assert "coordinator-owned B" in str(exc)
     else:
         raise AssertionError("mismatched A -> B target injection must be rejected")
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__]))

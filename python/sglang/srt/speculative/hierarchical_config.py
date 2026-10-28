@@ -11,12 +11,16 @@ def cascade_pending_width(inner_block_size: int, rounds: int) -> int:
     DFlash's block size includes its input anchor, but its published result
     excludes that anchor and contains up to ``inner_block_size`` tokens: up to
     ``inner_block_size - 1`` accepted A proposals plus one B recovery token.
-    That recovery is the next round's anchor and remains part of C's pending
-    sequence, so each round contributes up to the full block size.
+    A recovery from each non-final round is the next round's anchor and remains
+    part of C's pending sequence. With the C-to-B handoff, B does not verify the
+    final A block: its ``inner_block_size - 1`` proposals go directly to C, and
+    C produces the recovery token for the complete outer window. Thus the first
+    ``rounds - 1`` rounds contribute the full block size and the final round
+    contributes ``inner_block_size - 1`` tokens.
     """
     if inner_block_size <= 0 or rounds <= 0:
         raise ValueError("inner_block_size and rounds must be positive")
-    return inner_block_size * rounds
+    return inner_block_size * rounds - 1
 
 
 def cascade_verify_width(inner_block_size: int, rounds: int) -> int:

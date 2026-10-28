@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Self-contained Domino-style benchmark for A+B+C, C, and A+C.
 
 This file intentionally does not import or execute code from the Domino
@@ -12,12 +11,11 @@ import argparse
 import json
 import os
 import random
-import signal
 import shlex
+import signal
 import socket
 import statistics
 import subprocess
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
@@ -30,7 +28,6 @@ import requests
 import torch
 from datasets import load_dataset
 from transformers import AutoTokenizer
-
 
 DEFAULT_TASKS = (
     "gsm8k:128,math500:128,humaneval:164,mbpp:128,"
@@ -48,6 +45,11 @@ DEFAULT_INTERMEDIATE = (
     "/mnt/workspace/lijiasheng/huggingface/hub/models--Qwen--Qwen3-4B-FP8/"
     "snapshots/96b30dc13593a244a5e59e84687309f53c375cfa"
 )
+MODE_OUTPUT_NAMES = {
+    "abc": "abc_hierarchical",
+    "c": "c_only",
+    "ac": "ac_dflash",
+}
 SERVER_START_TIMEOUT_S = 3600
 
 
@@ -580,8 +582,13 @@ def main() -> None:
     parser.add_argument("--target-model", default=DEFAULT_TARGET)
     parser.add_argument("--draft-model", default=DEFAULT_DRAFT)
     parser.add_argument("--intermediate-model", default=DEFAULT_INTERMEDIATE)
-    parser.add_argument("--intermediate-model-quantization", default="fp8")
+    parser.add_argument("--intermediate-model-quantization", default=None)
     parser.add_argument("--speculative-draft-model-quantization", default=None)
+    parser.add_argument(
+        "--modes",
+        default="abc,c,ac",
+        help="Comma-separated benchmark modes: abc, c, ac.",
+    )
     parser.add_argument("--tasks", default=DEFAULT_TASKS)
     parser.add_argument("--concurrencies", default="1,2,4,8,16,32,64")
     parser.add_argument("--max-new-tokens", type=int, default=2048)
@@ -607,6 +614,21 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
 
+    modes = [mode.strip().lower() for mode in args.modes.split(",") if mode.strip()]
+    invalid_modes = [mode for mode in modes if mode not in MODE_OUTPUT_NAMES]
+    if not modes or invalid_modes:
+        parser.error(
+            "--modes must contain one or more of abc,c,ac; "
+            f"invalid values: {invalid_modes}"
+        )
+    if len(modes) != len(set(modes)):
+        parser.error("--modes must not contain duplicates")
+    if (
+        args.intermediate_model_quantization is not None
+        and args.intermediate_model_quantization.lower() in {"none", "unquant"}
+    ):
+        args.intermediate_model_quantization = None
+
     if args.temperature != 0 or args.top_k != 1:
         parser.error("HierarchicalSpec v1 benchmark requires greedy decoding: temperature=0 and top_k=1")
     if args.cascade_rounds <= 0 or args.dflash_block_size <= 0:
@@ -627,11 +649,10 @@ def main() -> None:
     print("Loading and formatting all benchmark prompts...")
     prompts_by_task = {name: build_prompts(name, tokenizer, required_count) for name, _ in tasks}
 
-    modes = (("abc", "abc_hierarchical"), ("c", "c_only"), ("ac", "ac_dflash"))
-    for mode, output_name in modes:
+    for mode in modes:
+        output_name = MODE_OUTPUT_NAMES[mode]
         port = find_port()
         url = f"http://127.0.0.1:{port}"
-        backend = "flashinfer" if mode == "abc" else args.attention_backend
         cmd_args = server_args(args, mode)
         print(f"\n=== Starting {output_name} at {url} ===")
         proc = launch_server(args.target_model, url, cmd_args, SERVER_START_TIMEOUT_S)
@@ -685,7 +706,8 @@ def main() -> None:
         finally:
             stop_server(proc)
 
-    summarize_three_way(args.output_dir)
+    if set(modes) == set(MODE_OUTPUT_NAMES):
+        summarize_three_way(args.output_dir)
     print(f"Benchmark reports written to {args.output_dir}")
 
 

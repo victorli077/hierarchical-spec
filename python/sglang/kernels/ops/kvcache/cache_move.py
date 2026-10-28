@@ -207,3 +207,91 @@ def copy_all_layer_kv_cache_func(
         num_warps=kv_copy_config["num_warps"],
         num_stages=2,
     )
+
+
+@triton.jit
+def copy_all_layer_kv_cache_cross_pool_tiled(
+    src_data_ptrs,
+    src_strides,
+    dst_data_ptrs,
+    dst_strides,
+    tgt_loc_ptr,
+    src_loc_ptr,
+    num_locs,
+    num_locs_upper: tl.constexpr,
+    BYTES_PER_TILE: tl.constexpr,
+):
+    """Copy the same logical KV rows between two independent pools."""
+    bid = tl.program_id(0)
+    tid = tl.program_id(1)
+
+    src_stride = tl.load(src_strides + bid)
+    dst_stride = tl.load(dst_strides + bid)
+    src_base = tl.load(src_data_ptrs + bid)
+    dst_base = tl.load(dst_data_ptrs + bid)
+    src_base = tl.cast(src_base, tl.pointer_type(tl.uint8))
+    dst_base = tl.cast(dst_base, tl.pointer_type(tl.uint8))
+
+    byte_off = tid * BYTES_PER_TILE + tl.arange(0, BYTES_PER_TILE)
+    mask_byte = byte_off < src_stride
+    tl.multiple_of(byte_off, 16)
+
+    loc_idx = tl.arange(0, num_locs_upper)
+    mask_loc = loc_idx < num_locs
+    src_locs = tl.load(src_loc_ptr + loc_idx, mask=mask_loc, other=0)
+    dst_locs = tl.load(tgt_loc_ptr + loc_idx, mask=mask_loc, other=0)
+    src_ptr = src_base + src_locs[:, None] * src_stride + byte_off[None, :]
+    dst_ptr = dst_base + dst_locs[:, None] * dst_stride + byte_off[None, :]
+    mask = mask_loc[:, None] & mask_byte[None, :]
+    vals = tl.load(src_ptr, mask=mask, other=0)
+    tl.store(dst_ptr, vals, mask=mask)
+
+
+def copy_all_layer_kv_cache_cross_pool_func(
+    src_data_ptrs: torch.Tensor,
+    src_strides: torch.Tensor,
+    dst_data_ptrs: torch.Tensor,
+    dst_strides: torch.Tensor,
+    tgt_loc: torch.Tensor,
+    src_loc: torch.Tensor,
+    num_locs: int,
+    kv_copy_config: dict,
+) -> None:
+    """Copy K/V rows from a source pool into a separate destination pool.
+
+    The source and destination pools must have the same NHD row shape. The
+    wrapper chunks the location list to keep the fixed Triton tile bound small.
+    This is intentionally separate from ``copy_all_layer_kv_cache_func``, which
+    copies within one pool and therefore cannot express different source and
+    destination data pointers.
+    """
+    if _is_cpu:
+        raise NotImplementedError("cross-pool KV copy is CUDA-only")
+    if num_locs <= 0:
+        return
+    if src_data_ptrs.numel() != dst_data_ptrs.numel():
+        raise ValueError("source and destination KV pool layer counts differ")
+    chunk_upper = int(kv_copy_config.get("num_locs_upper", 256))
+    if chunk_upper <= 0:
+        raise ValueError(f"invalid KV copy chunk bound: {chunk_upper}")
+    bytes_per_tile = int(kv_copy_config["bytes_per_tile"])
+    byte_tiles = int(kv_copy_config["byte_tiles"])
+    config = {"num_warps": int(kv_copy_config["num_warps"])}
+    for start in range(0, int(num_locs), chunk_upper):
+        end = min(start + chunk_upper, int(num_locs))
+        src_chunk = src_loc[start:end]
+        dst_chunk = tgt_loc[start:end]
+        grid = (src_data_ptrs.numel(), byte_tiles)
+        copy_all_layer_kv_cache_cross_pool_tiled[grid](
+            src_data_ptrs,
+            src_strides,
+            dst_data_ptrs,
+            dst_strides,
+            dst_chunk,
+            src_chunk,
+            end - start,
+            chunk_upper,
+            BYTES_PER_TILE=bytes_per_tile,
+            num_warps=config["num_warps"],
+            num_stages=2,
+        )

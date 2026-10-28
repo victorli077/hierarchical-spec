@@ -10,12 +10,19 @@ from __future__ import annotations
 
 import copy
 import logging
+import time
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 import torch
+
+from sglang.kernels.ops.kvcache.cache_move import (
+    copy_all_layer_kv_cache_cross_pool_func,
+)
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.forward_batch_info import (
@@ -38,6 +45,8 @@ from sglang.srt.speculative.hierarchical_config import cascade_verify_width
 from sglang.srt.speculative.hierarchical_types import (
     append_pending_round_,
     greedy_anchor_block_accept,
+    pending_lens_for_b_round,
+    should_run_b_verify,
 )
 from sglang.srt.speculative.spec_utils import assign_req_to_token_pool_func
 
@@ -46,6 +55,124 @@ if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_hierarchical_kv_copy_strides(
+    src_strides: torch.Tensor, dst_strides: torch.Tensor
+) -> None:
+    """Require identical physical row widths for the experimental KV copy."""
+    if src_strides.shape != dst_strides.shape or not torch.equal(
+        src_strides, dst_strides
+    ):
+        raise RuntimeError(
+            "HierarchicalSpec C->B KV copy requires identical K/V row strides"
+        )
+
+
+class _HierarchicalCudaTimer:
+    """Record one outer decode timeline with CUDA events."""
+
+    def __init__(self, *, enabled: bool, stage_names: list[str]):
+        self.enabled = enabled
+        self.stage_names = stage_names
+        self.events = (
+            [torch.cuda.Event(enable_timing=True) for _ in range(len(stage_names) + 1)]
+            if enabled
+            else []
+        )
+        self._next_stage = 0
+        self._wall_start = 0.0
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._next_stage = 0
+        self._wall_start = time.perf_counter()
+        self.events[0].record()
+
+    def mark(self, stage_name: str) -> None:
+        if not self.enabled:
+            return
+        expected = self.stage_names[self._next_stage]
+        if stage_name != expected:
+            raise RuntimeError(
+                "HierarchicalSpec timing stage order mismatch: "
+                f"expected {expected!r}, got {stage_name!r}."
+            )
+        self._next_stage += 1
+        self.events[self._next_stage].record()
+
+    def finish(self) -> dict[str, float]:
+        if not self.enabled:
+            return {}
+        if self._next_stage != len(self.stage_names):
+            raise RuntimeError(
+                "HierarchicalSpec timing ended before every stage was marked: "
+                f"marked={self._next_stage}, expected={len(self.stage_names)}."
+            )
+        self.events[-1].synchronize()
+        wall_ms = (time.perf_counter() - self._wall_start) * 1000.0
+        result = {
+            name: self.events[index].elapsed_time(self.events[index + 1])
+            for index, name in enumerate(self.stage_names)
+        }
+        event_total_ms = sum(result.values())
+        # Event timings include device gaps; wall time also includes Python
+        # setup and the final synchronization, which are reported as residual.
+        total_ms = max(wall_ms, event_total_ms)
+        result["host_launch_sync_residual"] = max(total_ms - event_total_ms, 0.0)
+        result["total"] = total_ms
+        return result
+
+
+class _HierarchicalTimingReporter:
+    """Aggregate stage samples and periodically log average time and share."""
+
+    def __init__(self, *, enabled: bool, interval: int, stage_names: list[str]):
+        self.enabled = enabled
+        self.interval = max(int(interval), 1)
+        self.stage_names = [*stage_names, "host_launch_sync_residual"]
+        self._count = 0
+        self._totals: dict[str, float] = defaultdict(float)
+
+    def add(self, sample: dict[str, float], *, batch_size: int) -> None:
+        if not self.enabled:
+            return
+        self._count += 1
+        for name in [*self.stage_names, "total"]:
+            self._totals[name] += float(sample.get(name, 0.0))
+        if self._count < self.interval:
+            return
+
+        total_ms = self._totals["total"] / self._count
+        parts = []
+        for name in self.stage_names:
+            avg_ms = self._totals[name] / self._count
+            share = 100.0 * avg_ms / total_ms if total_ms > 0 else 0.0
+            parts.append(f"{name}={avg_ms:.3f} ms ({share:.1f}%)")
+        round_names = [name for name in self.stage_names if name.startswith("b_round_")]
+        round_ms = sum(self._totals[name] for name in round_names) / self._count
+        round_share = 100.0 * round_ms / total_ms if total_ms > 0 else 0.0
+        a_round_names = [
+            name for name in self.stage_names if name.startswith("a_round_")
+        ]
+        a_round_ms = sum(self._totals[name] for name in a_round_names) / self._count
+        a_round_share = 100.0 * a_round_ms / total_ms if total_ms > 0 else 0.0
+        logger.info(
+            "HierarchicalSpec timing: samples=%d, latest_bs=%d, avg_total=%.3f ms | "
+            "%s | a_rounds_total=%.3f ms (%.1f%%) | "
+            "b_rounds_total=%.3f ms (%.1f%%)",
+            self._count,
+            batch_size,
+            total_ms,
+            " | ".join(parts),
+            a_round_ms,
+            a_round_share,
+            round_ms,
+            round_share,
+        )
+        self._count = 0
+        self._totals.clear()
 
 
 def build_intermediate_tp_worker(
@@ -287,6 +414,46 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         self._outer_position_offsets = torch.arange(
             self.outer_block_size, dtype=torch.int64, device=self.device
         )
+        self._c_to_b_kv_copy_metadata = None
+        self.use_c_to_b_kv_handoff = bool(
+            envs.SGLANG_ENABLE_HIERARCHICAL_C_KV_COPY.get()
+        )
+        timing_enabled = bool(envs.SGLANG_LOG_HIERARCHICAL_TIMING.get())
+        self._timing_stage_names = [
+            "b_prepare_cache_rollback",
+            "candidate_cache_setup",
+            *[
+                stage
+                for index in range(self.cascade_rounds)
+                for stage in (
+                    (f"a_round_{index + 1}",)
+                    if self.use_c_to_b_kv_handoff and index == self.cascade_rounds - 1
+                    else (f"a_round_{index + 1}", f"b_round_{index + 1}")
+                )
+            ],
+            "candidate_cache_finalize",
+            "c_verify_setup",
+            "c_model_verify",
+            "c_accept_postprocess",
+            "c_hidden_publish",
+            "c_to_b_kv_copy",
+            "c_result_finalize",
+        ]
+        self._decode_timer = _HierarchicalCudaTimer(
+            enabled=timing_enabled,
+            stage_names=self._timing_stage_names,
+        )
+        self._timing_reporter = _HierarchicalTimingReporter(
+            enabled=timing_enabled,
+            interval=envs.SGLANG_LOG_HIERARCHICAL_TIMING_INTERVAL.get(),
+            stage_names=self._timing_stage_names,
+        )
+        if timing_enabled:
+            logger.warning(
+                "HierarchicalSpec CUDA timing is enabled (report interval=%d); "
+                "the end-of-decode synchronization adds profiling overhead.",
+                self._timing_reporter.interval,
+            )
 
         intermediate_worker = build_intermediate_tp_worker(
             server_args=server_args,
@@ -452,6 +619,51 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             req_to_token_pool=b_pool,
             token_to_kv_pool_allocator=b_allocator,
         )
+        if self.use_c_to_b_kv_handoff:
+            self._c_to_b_kv_copy_metadata = self._build_c_to_b_kv_copy_metadata()
+
+    def _build_c_to_b_kv_copy_metadata(self):
+        """Validate and cache immutable pointers used by the copy probe."""
+        # TpModelWorker.get_memory_pool() returns (request pool, KV allocator),
+        # not the underlying KV data pool. Resolve the latter through the
+        # allocator's public interface before inspecting K/V buffers.
+        _, c_allocator = self.target_worker.get_memory_pool()
+        _, b_allocator = self.intermediate_worker.get_memory_pool()
+        c_pool = c_allocator.get_kvcache()
+        b_pool = b_allocator.get_kvcache()
+        (
+            src_ptrs,
+            src_strides,
+            src_row_bytes,
+            src_buffer_specs,
+        ) = self._kv_pool_copy_metadata(c_pool)
+        (
+            dst_ptrs,
+            dst_strides,
+            dst_row_bytes,
+            dst_buffer_specs,
+        ) = self._kv_pool_copy_metadata(b_pool)
+        if src_ptrs.numel() != dst_ptrs.numel():
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy requires equal layer counts: "
+                f"C={src_ptrs.numel()}, B={dst_ptrs.numel()}"
+            )
+        _validate_hierarchical_kv_copy_strides(src_strides, dst_strides)
+        if src_row_bytes != dst_row_bytes:
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy requires identical K/V row widths"
+            )
+        if src_buffer_specs != dst_buffer_specs:
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy requires identical K/V row shapes"
+            )
+        return {
+            "src_ptrs": src_ptrs,
+            "src_strides": src_strides,
+            "dst_ptrs": dst_ptrs,
+            "dst_strides": dst_strides,
+            "row_bytes": src_row_bytes,
+        }
 
     def plan_memory_pool_configs(self, *, preloaded_weights_bytes: int):
         """Split one profiled KV budget between C and the independent B+A stack.
@@ -612,12 +824,14 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
+        self._decode_timer.mark("c_verify_setup")
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
             skip_attn_backend_init=(None if get_parallel().attn_dp_enabled else True),
         )
+        self._decode_timer.mark("c_model_verify")
         logits_output = target_out.logits_output
         logits = logits_output.next_token_logits.view(bs, width, -1)
         if batch.sampling_info is not None:
@@ -640,6 +854,7 @@ class HierarchicalSpecWorker(BaseSpecWorker):
                 out_tokens.reshape(-1),
                 chain_stride=width,
             )
+        self._decode_timer.mark("c_accept_postprocess")
 
         hidden = logits_output.hidden_states
         if hidden is None:
@@ -654,12 +869,18 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             positions=positions_2d.reshape(-1),
             commit_lens=commit_lens,
         )
+        self._decode_timer.mark("c_hidden_publish")
+        self._copy_c_kv_to_b_cache(
+            c_cache_locs=c_cache_locs,
+            b_cache_locs=b_cache_locs,
+        )
+        self._decode_timer.mark("c_to_b_kv_copy")
         logits_output.hidden_states = None
         next_draft_input = make_draft_input_v2(
             bonus_tokens=bonus,
             new_seq_lens=new_seq_lens,
         )
-        return GenerationBatchResult(
+        result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
@@ -671,6 +892,117 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
+        )
+        return result
+
+    @staticmethod
+    def _kv_pool_copy_metadata(pool):
+        """Return K/V pointers, byte strides, and row width for the copy probe."""
+        k_buffers = getattr(pool, "k_buffer", None)
+        v_buffers = getattr(pool, "v_buffer", None)
+        k_ptrs = getattr(pool, "k_data_ptrs", None)
+        v_ptrs = getattr(pool, "v_data_ptrs", None)
+        if (
+            k_buffers is None
+            or v_buffers is None
+            or len(k_buffers) == 0
+            or len(v_buffers) == 0
+            or k_ptrs is None
+            or v_ptrs is None
+        ):
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy requires ordinary NHD K/V buffers"
+            )
+        if getattr(pool, "kv_cache_layout", "nhd") != "nhd":
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy requires NHD KV cache layout"
+            )
+        if len(k_buffers) != len(v_buffers):
+            raise RuntimeError("HierarchicalSpec K/V layer counts do not match")
+        if getattr(pool, "is_quantized_kv_cache", False):
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy does not support quantized KV caches"
+            )
+        for k_buffer, v_buffer in zip(k_buffers, v_buffers):
+            if k_buffer.ndim < 1 or v_buffer.ndim < 1:
+                raise RuntimeError(
+                    "HierarchicalSpec C->B KV copy requires row-addressable buffers"
+                )
+            if not k_buffer.is_contiguous() or not v_buffer.is_contiguous():
+                raise RuntimeError(
+                    "HierarchicalSpec C->B KV copy requires contiguous K/V buffers"
+                )
+        row_bytes = int(k_buffers[0].stride(0) * k_buffers[0].dtype.itemsize)
+        if any(
+            int(buffer.stride(0) * buffer.dtype.itemsize) != row_bytes
+            for buffer in [*k_buffers, *v_buffers]
+        ):
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy requires one row width per pool"
+            )
+        ptrs = torch.cat((k_ptrs, v_ptrs))
+        strides = torch.tensor(
+            [
+                *(int(buf.stride(0) * buf.dtype.itemsize) for buf in k_buffers),
+                *(int(buf.stride(0) * buf.dtype.itemsize) for buf in v_buffers),
+            ],
+            dtype=torch.int64,
+            device=ptrs.device,
+        )
+        buffer_specs = [
+            (tuple(buffer.shape[1:]), buffer.dtype)
+            for buffer in [*k_buffers, *v_buffers]
+        ]
+        return ptrs, strides, row_bytes, buffer_specs
+
+    def _copy_c_kv_to_b_cache(
+        self, *, c_cache_locs: torch.Tensor, b_cache_locs: torch.Tensor
+    ) -> None:
+        """Copy the full C verify window into B's cache at the outer boundary.
+
+        The copy covers the whole fixed verify window. B's committed sequence
+        length still determines which rows are read on the next forward, so
+        rejected suffix rows are harmless and avoid a ragged host/device sync.
+        """
+        if not self.use_c_to_b_kv_handoff:
+            return
+        if c_cache_locs.numel() != b_cache_locs.numel():
+            raise ValueError(
+                "C->B KV copy requires matching cache-location counts: "
+                f"C={c_cache_locs.numel()} ({tuple(c_cache_locs.shape)}), "
+                f"B={b_cache_locs.numel()} ({tuple(b_cache_locs.shape)})"
+            )
+        if c_cache_locs.numel() == 0:
+            return
+        metadata = self._c_to_b_kv_copy_metadata
+        if metadata is None:
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy metadata was not initialized"
+            )
+        src_ptrs = metadata["src_ptrs"]
+        src_strides = metadata["src_strides"]
+        dst_ptrs = metadata["dst_ptrs"]
+        dst_strides = metadata["dst_strides"]
+        # The pools are allocated with the same page-size-one NHD geometry in
+        # the supported v1 topology. Keep the location tensors on device and
+        # use one fused kernel launch per chunk, rather than a Python loop over
+        # layers and K/V tensors.
+        c_cache_locs = c_cache_locs.reshape(-1).to(torch.int64)
+        b_cache_locs = b_cache_locs.reshape(-1).to(torch.int64)
+        copy_all_layer_kv_cache_cross_pool_func(
+            src_data_ptrs=src_ptrs,
+            src_strides=src_strides,
+            dst_data_ptrs=dst_ptrs,
+            dst_strides=dst_strides,
+            tgt_loc=b_cache_locs,
+            src_loc=c_cache_locs,
+            num_locs=int(c_cache_locs.numel()),
+            kv_copy_config={
+                "bytes_per_tile": 128,
+                "byte_tiles": (metadata["row_bytes"] + 127) // 128,
+                "num_warps": 4,
+                "num_locs_upper": 256,
+            },
         )
 
     def _prepare_b_decode_window(self, batch):
@@ -837,7 +1169,9 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             raise ValueError(
                 "HierarchicalSpec v1 does not support constrained decoding"
             )
+        self._decode_timer.start()
         b_batch, b_cache_locs = self._prepare_b_decode_window(batch)
+        self._decode_timer.mark("b_prepare_cache_rollback")
         bs = batch.batch_size()
         candidate_chain = torch.zeros(
             (bs, self.outer_block_size), dtype=torch.int64, device=self.device
@@ -859,41 +1193,85 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             torch.arange(bs, device=self.device, dtype=torch.int64)[:, None]
             * scatter_width
         )
-        for _ in range(self.cascade_rounds):
+        self._decode_timer.mark("candidate_cache_setup")
+        for round_index in range(self.cascade_rounds):
+            is_final_round = round_index == self.cascade_rounds - 1
+            skip_b_verify = not should_run_b_verify(
+                round_index,
+                rounds=self.cascade_rounds,
+                use_c_to_b_kv_handoff=self.use_c_to_b_kv_handoff,
+            )
             inner_result = self.inner_dflash.forward_provisional(
                 b_batch,
                 grammar_barrier=grammar_barrier,
                 pp_proxy_tensors=pp_proxy_tensors,
+                skip_target_verify=skip_b_verify,
+                on_draft_complete=(
+                    lambda round_index=round_index: self._decode_timer.mark(
+                        f"a_round_{round_index + 1}"
+                    )
+                )
+                if self._decode_timer.enabled
+                else None,
             )
-            round_tokens = inner_result.next_token_ids.view(bs, self.inner_block_size)
+            round_width = (
+                self.inner_block_size - 1 if skip_b_verify else self.inner_block_size
+            )
+            round_tokens = inner_result.next_token_ids.view(bs, round_width)
             round_lens = inner_result.accept_lens.to(torch.int64)
+            # Non-final B bonuses seed the next A -> B round and therefore stay
+            # in C's proposal chain. With the C-to-B handoff enabled, the
+            # final round contributes only A's ``L-1`` proposals; C verifies
+            # them directly and supplies the outer bonus.
+            if not skip_b_verify:
+                round_lens = pending_lens_for_b_round(
+                    round_lens, is_final_round=is_final_round
+                )
+            round_offsets_for_append = (
+                round_offsets
+                if not skip_b_verify
+                else torch.arange(
+                    self.inner_block_size - 1,
+                    dtype=torch.int64,
+                    device=self.device,
+                )[None, :]
+            )
             append_pending_round_(
                 scatter_storage,
                 pending_lens,
                 round_tokens,
                 round_lens,
                 row_offsets=row_offsets,
-                round_offsets=round_offsets,
+                round_offsets=round_offsets_for_append,
                 overflow_col=self.outer_block_size,
             )
-            b_batch.seq_lens = inner_result.new_seq_lens
-            b_batch.spec_info = inner_result.next_draft_input
-            allocated_cpu = batch.seq_lens_cpu + self.outer_block_size
-            b_batch.spec_info.nxt_kv_lens_cpu = allocated_cpu.to(torch.int32)
-            b_batch.spec_info.nxt_kv_lens_sum = int(allocated_cpu.sum())
-            b_batch.seq_lens_cpu = None
+            if not skip_b_verify:
+                b_batch.seq_lens = inner_result.new_seq_lens
+                b_batch.spec_info = inner_result.next_draft_input
+                allocated_cpu = batch.seq_lens_cpu + self.outer_block_size
+                b_batch.spec_info.nxt_kv_lens_cpu = allocated_cpu.to(torch.int32)
+                b_batch.spec_info.nxt_kv_lens_sum = int(allocated_cpu.sum())
+                b_batch.seq_lens_cpu = None
+            if not skip_b_verify:
+                self._decode_timer.mark(f"b_round_{round_index + 1}")
 
-        self._materialize_b_final_recovery(b_batch)
+        if not self.use_c_to_b_kv_handoff:
+            self._materialize_b_final_recovery(b_batch)
         candidate_chain.copy_(scatter_storage[:, : self.outer_block_size])
-        return self._verify_with_c(
+        self._decode_timer.mark("candidate_cache_finalize")
+        result = self._verify_with_c(
             batch,
             candidate_chain=candidate_chain,
             pending_lens=pending_lens,
             b_cache_locs=b_cache_locs,
         )
+        self._decode_timer.mark("c_result_finalize")
+        timing_sample = self._decode_timer.finish()
+        self._timing_reporter.add(timing_sample, batch_size=bs)
+        return result
 
     def _materialize_b_final_recovery(self, b_batch) -> None:
-        """Write the Kth B recovery token into B KV before C may accept it."""
+        """Write the legacy final B recovery token into B KV."""
         bs = b_batch.batch_size()
         positions = b_batch.seq_lens.to(torch.int64)
         b_pool, _ = self.intermediate_worker.get_memory_pool()

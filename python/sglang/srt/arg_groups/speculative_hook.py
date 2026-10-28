@@ -1229,6 +1229,18 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_hierarchical(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
+    # ``unquant`` is accepted by the top-level quantization resolver as an
+    # explicit request to use the checkpoint's native weights, but it is not a
+    # ModelConfig quantization backend.  Normalize it before the intermediate
+    # worker forwards the override to ModelConfig; otherwise startup fails with
+    # ``Unknown quantization method: unquant``.
+    if cfg.speculative_intermediate_quantization == "unquant":
+        declare_resolution(
+            server_args,
+            "_handle_hierarchical",
+            speculative_intermediate_quantization=None,
+        )
+        cfg = resolving_view(server_args)
     if cfg.pp_size != 1:
         raise ValueError("HierarchicalSpec v1 requires pp_size == 1.")
     if cfg.page_size != 1:
@@ -1243,6 +1255,7 @@ def _handle_hierarchical(server_args: ServerArgs) -> None:
                 "HierarchicalSpec v1 device-map syntax is only supported with tp_size=1."
             )
         import torch
+
         from sglang.srt.speculative.hierarchical_config import parse_device_map
 
         device_map = parse_device_map(
@@ -1280,9 +1293,10 @@ def _handle_hierarchical(server_args: ServerArgs) -> None:
                 "HierarchicalSpec requires --speculative-dflash-block-size to be "
                 f"positive, got {cfg.speculative_dflash_block_size}."
             )
-        if cfg.speculative_num_draft_tokens is not None and int(
-            cfg.speculative_num_draft_tokens
-        ) != block_size:
+        if (
+            cfg.speculative_num_draft_tokens is not None
+            and int(cfg.speculative_num_draft_tokens) != block_size
+        ):
             raise ValueError(
                 "Both --speculative-num-draft-tokens and "
                 "--speculative-dflash-block-size are set but they differ. "
@@ -1324,7 +1338,7 @@ def _handle_hierarchical(server_args: ServerArgs) -> None:
         speculative_num_steps=1,
         disable_overlap_schedule=True,
         # A -> B uses the native DFlash width while B -> C uses the wider
-        # 1 + K*L verify shape. V1 deliberately stays eager until separate
+        # K*L verify shape. V1 deliberately stays eager until separate
         # graph capture contracts exist for both runners.
         disable_cuda_graph=True,
         disable_decode_cuda_graph=True,
@@ -1333,9 +1347,9 @@ def _handle_hierarchical(server_args: ServerArgs) -> None:
         enable_mixed_chunk=False,
         speculative_eagle_topk=1,
         speculative_use_rejection_sampling=False,
-        # The B forced-token materialization path currently relies on the
-        # FlashInfer TARGET_VERIFY metadata contract. Resolve auto explicitly
-        # so unsupported FA3 hosts fail neither warmup nor a live request.
+        # The B TARGET_VERIFY path currently relies on FlashInfer metadata.
+        # Resolve auto explicitly so unsupported FA3 hosts fail neither warmup
+        # nor a live request.
         attention_backend="flashinfer",
     )
 

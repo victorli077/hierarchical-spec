@@ -1,6 +1,7 @@
 import logging
 import math
 import os
+from collections.abc import Callable
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
@@ -2339,6 +2340,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        on_draft_complete: Callable[[], None] | None = None,
+        skip_target_verify: bool = False,
     ) -> GenerationBatchResult:
         """Run one DFlash round without publishing a scheduler commit.
 
@@ -2347,6 +2350,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         argument: the returned tokens and lengths remain provisional until an
         outer target verifies them. The caller must provide a batch translated
         into the auxiliary target's request rows and KV slot namespace.
+        ``on_draft_complete`` runs after A has produced its block and before B
+        starts verification, allowing the hierarchical profiler to split them.
+        When ``skip_target_verify`` is true, return immediately after A has
+        produced its block.  HierarchicalSpec uses this for the final inner
+        round: C verifies those A proposals together with the preceding B
+        rounds, so B must not perform an extra final verification.
         """
         # prepare_for_verify() changes the batch phase to TARGET_VERIFY in-place.
         # A normal DFlash request gets a fresh scheduler batch on its next step,
@@ -2361,6 +2370,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish=None,
                 grammar_barrier=grammar_barrier,
                 pp_proxy_tensors=pp_proxy_tensors,
+                on_draft_complete=on_draft_complete,
+                skip_target_verify=skip_target_verify,
             )
         finally:
             batch.forward_mode = forward_mode
@@ -2372,6 +2383,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        on_draft_complete: Callable[[], None] | None = None,
+        skip_target_verify: bool = False,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
 
@@ -2847,6 +2860,26 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_tree = (
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
         )
+        if on_draft_complete is not None:
+            on_draft_complete()
+
+        if skip_target_verify:
+            # The final A block is consumed directly by the outer C verify.
+            # Do not run the auxiliary B target, do not materialize B target
+            # hidden states, and do not publish a provisional B commit.
+            return GenerationBatchResult(
+                logits_output=draft_logits_output,
+                # The anchor is already present in the preceding B result;
+                # only A's proposals belong to the outer C candidate chain.
+                next_token_ids=draft_tokens[:, 1:].reshape(-1),
+                accept_lens=torch.full(
+                    (bs,), block_size - 1, dtype=torch.int32, device=device
+                ),
+                can_run_cuda_graph=draft_out.can_run_graph,
+                speculative_num_draft_tokens=block_size - 1,
+                speculative_output_stride=block_size - 1,
+                new_seq_lens=batch.seq_lens,
+            )
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.

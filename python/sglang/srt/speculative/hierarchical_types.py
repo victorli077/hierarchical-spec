@@ -58,6 +58,38 @@ class CascadeVerifyResult:
     accepted_end_hidden: torch.Tensor | None = None
 
 
+def pending_lens_for_b_round(
+    commit_lens: torch.Tensor, *, is_final_round: bool
+) -> torch.Tensor:
+    """Return the B tokens retained for C from one inner round.
+
+    DFlash ``commit_lens`` includes the B bonus. Non-final bonuses are retained
+    because each one anchors the following inner round. The final bonus is
+    excluded so C generates the only bonus at the outer-window boundary.
+    """
+    if not is_final_round:
+        return commit_lens
+    # DFlash guarantees commit_lens >= 1 because every non-idle row includes
+    # exactly one bonus token.
+    return commit_lens - 1
+
+
+def should_run_b_verify(
+    round_index: int, *, rounds: int, use_c_to_b_kv_handoff: bool
+) -> bool:
+    """Return whether B verifies one inner A block.
+
+    With the C-to-B handoff, the final A block is verified directly by C and
+    C's full-window KV replaces B's reserved rows. The legacy path verifies all
+    K inner blocks with B.
+    """
+    if rounds <= 0:
+        raise ValueError("rounds must be positive")
+    if round_index < 0 or round_index >= rounds:
+        raise ValueError("round_index must be within the configured rounds")
+    return not (use_c_to_b_kv_handoff and round_index == rounds - 1)
+
+
 def append_pending_round_(
     storage: torch.Tensor,
     pending_lens: torch.Tensor,

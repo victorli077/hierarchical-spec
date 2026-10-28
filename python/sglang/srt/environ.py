@@ -356,6 +356,14 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
+    # Opt-in CUDA-event breakdown for HierarchicalSpec decode. The interval is
+    # the number of outer decode batches accumulated into each log record.
+    SGLANG_LOG_HIERARCHICAL_TIMING = EnvBool(False)
+    SGLANG_LOG_HIERARCHICAL_TIMING_INTERVAL = EnvInt(40)
+    # HierarchicalSpec outer-boundary handoff: skip the final B verify and copy
+    # C's verify-window KV rows into B's independent cache. Set to false for
+    # the legacy K-B-verify path or matched A/B experiments.
+    SGLANG_ENABLE_HIERARCHICAL_C_KV_COPY = EnvBool(True)
     # Read by JIT kernel headers (sgl_kernel/logging.h): DEBUG | INFO | WARNING | ERROR.
     SGLANG_JIT_LOG_LEVEL = EnvStr("WARNING")
     SGLANG_ENABLE_RANK_CONSENSUS_CHECKER = EnvBool(False)
