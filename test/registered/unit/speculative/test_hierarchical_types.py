@@ -209,6 +209,50 @@ def test_c_to_b_kv_copy_requires_identical_row_strides():
         )
 
 
+def test_b_decode_window_roll_retains_committed_prefix_and_allocates_tail():
+    class RequestPool:
+        def __init__(self):
+            self.req_to_token = torch.zeros((1, 32), dtype=torch.int32)
+
+    class Allocator:
+        page_size = 1
+
+        def __init__(self):
+            self.next_slot = 100
+
+        def alloc(self, count):
+            slots = torch.arange(self.next_slot, self.next_slot + count)
+            self.next_slot += count
+            return slots
+
+    req_pool = RequestPool()
+    allocator = Allocator()
+    worker = SimpleNamespace(
+        is_draft_worker=False,
+        is_auxiliary_target=True,
+        get_memory_pool=lambda: (req_pool, allocator),
+    )
+    stage = IntermediateStage(worker)
+    req = SimpleNamespace(rid="r0")
+    stage._request_rows[req.rid] = 0
+    # Previous committed prefix p=10 and speculative window width W=4.
+    req_pool.req_to_token[0, 10:14] = torch.tensor([10, 11, 12, 13])
+    stage._cache_lengths[req.rid] = 14
+    stage._committed_lengths[req.rid] = 10
+
+    locs = stage.roll_decode_window(
+        [req],
+        torch.tensor([12], dtype=torch.int64),
+        width=4,
+        req_pool_indices=torch.tensor([0], dtype=torch.int64),
+    )
+
+    assert locs.tolist() == [[12, 13, 100, 101]]
+    assert req_pool.req_to_token[0, 10:16].tolist() == [10, 11, 12, 13, 100, 101]
+    assert stage._cache_lengths[req.rid] == 16
+    assert stage._committed_lengths[req.rid] == 12
+
+
 class TestHierarchicalKvCopyMetadata(CustomTestCase):
     def test_resolves_kv_pool_through_allocator(self):
         def make_worker():

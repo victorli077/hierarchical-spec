@@ -2502,7 +2502,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         *,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        on_before_draft: Callable[[], None] | None = None,
         on_draft_complete: Callable[[], None] | None = None,
+        on_before_target_verify: Callable[[], None] | None = None,
         skip_target_verify: bool = False,
     ) -> GenerationBatchResult:
         """Run one DFlash round without publishing a scheduler commit.
@@ -2514,6 +2516,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         into the auxiliary target's request rows and KV slot namespace.
         ``on_draft_complete`` runs after A has produced its block and before B
         starts verification, allowing the hierarchical profiler to split them.
+        ``on_before_target_verify`` runs after A has produced its block and
+        immediately before the auxiliary target verify. HierarchicalSpec uses
+        this boundary to wait for an asynchronous C-to-B KV handoff without
+        delaying A.
         When ``skip_target_verify`` is true, return immediately after A has
         produced its block.  HierarchicalSpec uses this for the final inner
         round: C verifies those A proposals together with the preceding B
@@ -2532,7 +2538,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 on_publish=None,
                 grammar_barrier=grammar_barrier,
                 pp_proxy_tensors=pp_proxy_tensors,
+                on_before_draft=on_before_draft,
                 on_draft_complete=on_draft_complete,
+                on_before_target_verify=on_before_target_verify,
                 skip_target_verify=skip_target_verify,
             )
         finally:
@@ -2545,7 +2553,9 @@ class DFlashWorkerV2(BaseSpecWorker):
         on_publish=None,
         grammar_barrier=None,
         pp_proxy_tensors=None,
+        on_before_draft: Callable[[], None] | None = None,
         on_draft_complete: Callable[[], None] | None = None,
+        on_before_target_verify: Callable[[], None] | None = None,
         skip_target_verify: bool = False,
     ) -> GenerationBatchResult:
         self._validate_phase1_sampling_support(batch)
@@ -2695,6 +2705,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._decode_timer.start()
 
         # --- 1) Draft a fixed block with the draft model.
+        if on_before_draft is not None:
+            on_before_draft()
         target_model = self.target_worker.model_runner.model
         embed_module = unwrap_lora_layer(
             _resolve_dflash_embedding_module(self.draft_model, target_model)
@@ -3045,6 +3057,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 speculative_output_stride=block_size - 1,
                 new_seq_lens=batch.seq_lens,
             )
+
+        if on_before_target_verify is not None:
+            on_before_target_verify()
 
         # --- 2) Target verify.
         # TARGET_VERIFY uses standard causal masking; custom masks are unnecessary here.

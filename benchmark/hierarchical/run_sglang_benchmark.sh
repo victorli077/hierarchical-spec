@@ -38,6 +38,7 @@ HIERARCHICAL_C_KV_COPY="${HIERARCHICAL_C_KV_COPY:-1}"
 HIERARCHICAL_B_CUDA_GRAPH="${HIERARCHICAL_B_CUDA_GRAPH:-0}"
 HIERARCHICAL_A_CUDA_GRAPH="${HIERARCHICAL_A_CUDA_GRAPH:-0}"
 HIERARCHICAL_C_CUDA_GRAPH="${HIERARCHICAL_C_CUDA_GRAPH:-0}"
+DISABLE_OVERLAP_SCHEDULE="${DISABLE_OVERLAP_SCHEDULE:-0}"
 BENCHMARK_MODES="${BENCHMARK_MODES:-abc,c,ac}"
 OUT_DIR="${OUT_DIR:-${SCRIPT_DIR}/outputs/sglang_hierarchical_$(date +%Y%m%d_%H%M%S)}"
 
@@ -129,6 +130,9 @@ fi
 if [[ "${BATCH_REQUESTS:-0}" == "1" ]]; then
   args+=(--batch-requests)
 fi
+if [[ "${DISABLE_OVERLAP_SCHEDULE}" == "1" ]]; then
+  args+=(--disable-overlap-schedule)
+fi
 
 echo "Benchmark modes: ${BENCHMARK_MODES}"
 echo "Target C: ${MODEL_PATH}"
@@ -143,6 +147,7 @@ echo "Hierarchical A CUDA Graph: ${HIERARCHICAL_A_CUDA_GRAPH}"
 echo "Hierarchical B CUDA Graph: ${HIERARCHICAL_B_CUDA_GRAPH}"
 echo "Hierarchical C CUDA Graph: ${HIERARCHICAL_C_CUDA_GRAPH}"
 echo "C->B KV handoff (K-1 B verifies): ${HIERARCHICAL_C_KV_COPY}"
+echo "Disable overlap schedule: ${DISABLE_OVERLAP_SCHEDULE}"
 
 "${PYTHON}" "${SCRIPT_DIR}/benchmark_three_way.py" "${args[@]}" \
   2>&1 | tee "${OUT_DIR}/benchmark.log"

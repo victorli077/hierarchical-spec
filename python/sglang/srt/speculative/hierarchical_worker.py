@@ -82,13 +82,49 @@ class _HierarchicalCudaTimer:
         )
         self._next_stage = 0
         self._wall_start = 0.0
+        self._aux_starts: dict[str, torch.cuda.Event] = {}
+        self._aux_ends: dict[str, torch.cuda.Event] = {}
+        self._external: dict[str, float] = {}
+        self._deferred_aux: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] = []
 
     def start(self) -> None:
         if not self.enabled:
             return
         self._next_stage = 0
         self._wall_start = time.perf_counter()
+        self._aux_starts.clear()
+        self._aux_ends.clear()
+        self._external.clear()
+        self._deferred_aux.clear()
         self.events[0].record()
+
+    def add_external(self, name: str, duration_ms: float) -> None:
+        if self.enabled:
+            self._external[name] = self._external.get(name, 0.0) + float(duration_ms)
+
+    def aux_start(self, name: str, *, stream=None) -> None:
+        if not self.enabled:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        self._aux_starts[name] = event
+
+    def aux_end(self, name: str, *, stream=None) -> None:
+        if not self.enabled:
+            return
+        if name not in self._aux_starts:
+            raise RuntimeError(
+                f"HierarchicalSpec timing aux stage {name!r} was not started"
+            )
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        self._aux_ends[name] = event
+
+    def defer_aux(
+        self, name: str, start: torch.cuda.Event, end: torch.cuda.Event
+    ) -> None:
+        if self.enabled:
+            self._deferred_aux.append((name, start, end))
 
     def mark(self, stage_name: str) -> None:
         if not self.enabled:
@@ -122,16 +158,34 @@ class _HierarchicalCudaTimer:
         total_ms = max(wall_ms, event_total_ms)
         result["host_launch_sync_residual"] = max(total_ms - event_total_ms, 0.0)
         result["total"] = total_ms
+        for name, start in self._aux_starts.items():
+            end = self._aux_ends.get(name)
+            # Auxiliary work may intentionally outlive this outer decode (the
+            # C->B copy is consumed by the next round). Never synchronize it
+            # here, because that would erase the intended overlap.
+            if end is not None and end.query():
+                result[name] = start.elapsed_time(end)
+        result.update(self._external)
+        for name, start, end in self._deferred_aux:
+            result[name] = result.get(name, 0.0) + start.elapsed_time(end)
         return result
 
 
 class _HierarchicalTimingReporter:
     """Aggregate stage samples and periodically log average time and share."""
 
-    def __init__(self, *, enabled: bool, interval: int, stage_names: list[str]):
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        interval: int,
+        stage_names: list[str],
+        aux_stage_names: list[str] | None = None,
+    ):
         self.enabled = enabled
         self.interval = max(int(interval), 1)
         self.stage_names = [*stage_names, "host_launch_sync_residual"]
+        self.aux_stage_names = list(aux_stage_names or [])
         self._count = 0
         self._totals: dict[str, float] = defaultdict(float)
         self._b_graph_replays = 0
@@ -156,7 +210,7 @@ class _HierarchicalTimingReporter:
         self._b_graph_fallbacks += int(b_graph_fallbacks)
         self._c_graph_replays += int(c_graph_replays)
         self._c_graph_fallbacks += int(c_graph_fallbacks)
-        for name in [*self.stage_names, "total"]:
+        for name in [*self.stage_names, *self.aux_stage_names, "total"]:
             self._totals[name] += float(sample.get(name, 0.0))
         if self._count < self.interval:
             return
@@ -167,6 +221,10 @@ class _HierarchicalTimingReporter:
             avg_ms = self._totals[name] / self._count
             share = 100.0 * avg_ms / total_ms if total_ms > 0 else 0.0
             parts.append(f"{name}={avg_ms:.3f} ms ({share:.1f}%)")
+        for name in self.aux_stage_names:
+            avg_ms = self._totals[name] / self._count
+            share = 100.0 * avg_ms / total_ms if total_ms > 0 else 0.0
+            parts.append(f"{name}={avg_ms:.3f} ms ({share:.1f}%, auxiliary)")
         round_names = [name for name in self.stage_names if name.startswith("b_round_")]
         round_ms = sum(self._totals[name] for name in round_names) / self._count
         round_share = 100.0 * round_ms / total_ms if total_ms > 0 else 0.0
@@ -332,6 +390,88 @@ class IntermediateStage:
             for slots in stale_slots:
                 slots.zero_()
 
+    def roll_decode_window(
+        self,
+        reqs,
+        committed_lengths: torch.Tensor,
+        *,
+        width: int,
+        req_pool_indices: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Advance a fixed B window while retaining committed prefix slots.
+
+        After C verifies an outer window, the old speculative rows become a
+        committed prefix (up to ``committed_lengths``).  Retain those physical
+        rows and allocate only the new tail required to keep a fixed-width
+        window. Rows leaving the speculative window are now committed prefix
+        rows and must remain allocated. Returning ``None`` asks the caller to
+        use the conservative trim-and-rebuild path (for example after a length
+        rollback).
+        """
+        if committed_lengths.device.type != "cpu":
+            raise ValueError("B rolling lengths must use CPU metadata")
+        width = int(width)
+        if width <= 0 or len(reqs) != int(committed_lengths.numel()):
+            return None
+        req_pool, allocator = self.worker.get_memory_pool()
+        new_lengths = [int(length) for length in committed_lengths.tolist()]
+        required_ends = []
+        alloc_counts = []
+        for req, new_committed in zip(reqs, new_lengths):
+            if req.rid not in self._request_rows:
+                return None
+            old_allocated = int(self._cache_lengths.get(req.rid, 0))
+            old_committed = int(self._committed_lengths.get(req.rid, 0))
+            required_end = new_committed + width
+            # A normal decode either starts from a prefill prefix (no window
+            # yet) or advances the previous fixed window.  Any regression or
+            # oversized gap is handled by the safe legacy path.
+            old_window_start = old_allocated - width
+            if (
+                old_allocated < width
+                or old_allocated - old_committed != width
+                or new_committed < old_window_start
+            ):
+                return None
+            if new_committed > old_allocated:
+                return None
+            if required_end < old_allocated:
+                return None
+            required_ends.append(required_end)
+            overlap_end = min(old_allocated, required_end)
+            alloc_counts.append(max(required_end - overlap_end, 0))
+
+        total_new = sum(alloc_counts)
+        new_slots = allocator.alloc(total_new) if total_new else None
+        if total_new and new_slots is None:
+            raise RuntimeError(
+                "HierarchicalSpec B KV cache is out of memory while rolling "
+                f"{total_new} new window slot(s)"
+            )
+
+        offset = 0
+        for req, new_committed, required_end, alloc_count in zip(
+            reqs, new_lengths, required_ends, alloc_counts
+        ):
+            row = self._request_rows[req.rid]
+            old_allocated = int(self._cache_lengths.get(req.rid, 0))
+            overlap_end = min(old_allocated, required_end)
+            if alloc_count:
+                req_pool.req_to_token[row, overlap_end:required_end] = new_slots[
+                    offset : offset + alloc_count
+                ].to(torch.int32)
+                offset += alloc_count
+            self._cache_lengths[req.rid] = required_end
+            self._committed_lengths[req.rid] = new_committed
+
+        positions = (
+            committed_lengths.to(device=req_pool_indices.device)[:, None]
+            + torch.arange(width, device=req_pool_indices.device, dtype=torch.int64)[
+                None, :
+            ]
+        )
+        return req_pool.req_to_token[req_pool_indices[:, None], positions]
+
     def release_request(self, rid: str) -> None:
         row = self._request_rows.pop(rid, None)
         if row is not None:
@@ -442,6 +582,9 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             self.outer_block_size, dtype=torch.int64, device=self.device
         )
         self._c_to_b_kv_copy_metadata = None
+        self._c_to_b_copy_stream = None
+        self._c_to_b_copy_done_event = None
+        self._pending_c_to_b_copy_timing = None
         self.use_c_to_b_kv_handoff = bool(
             envs.SGLANG_ENABLE_HIERARCHICAL_C_KV_COPY.get()
         )
@@ -463,8 +606,13 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             "c_model_verify",
             "c_accept_postprocess",
             "c_hidden_publish",
-            "c_to_b_kv_copy",
+            "c_to_b_kv_copy_launch",
             "c_result_finalize",
+        ]
+        self._timing_aux_stage_names = [
+            "c_to_b_kv_copy_async",
+            "b_wait_for_c_to_b_kv_copy",
+            "b_window_roll",
         ]
         self._decode_timer = _HierarchicalCudaTimer(
             enabled=timing_enabled,
@@ -474,6 +622,7 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             enabled=timing_enabled,
             interval=envs.SGLANG_LOG_HIERARCHICAL_TIMING_INTERVAL.get(),
             stage_names=self._timing_stage_names,
+            aux_stage_names=self._timing_aux_stage_names,
         )
         self._b_cuda_graph_capture_failed = False
         if timing_enabled:
@@ -650,6 +799,8 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         )
         if self.use_c_to_b_kv_handoff:
             self._c_to_b_kv_copy_metadata = self._build_c_to_b_kv_copy_metadata()
+            device_module = torch.get_device_module(self.device)
+            self._c_to_b_copy_stream = device_module.Stream(device=self.device)
 
     def _build_c_to_b_kv_copy_metadata(self):
         """Validate and cache immutable pointers used by the copy probe."""
@@ -820,19 +971,23 @@ class HierarchicalSpecWorker(BaseSpecWorker):
                 )
 
     def clear_cache_pool(self):
+        self._synchronize_pending_c_to_b_copy()
         self.coordinator.clear_cache_pool()
 
     def note_request_finished(self, *, rid: str, natural_stop: bool) -> None:
         del natural_stop
+        self._synchronize_pending_c_to_b_copy()
         self.coordinator.release_request(rid)
 
     def note_request_retracted(self, *, rid: str) -> None:
         # C has already released its request KV and reset kv_committed_len.
         # Drop B's independent row as well; re-prefill allocates a fresh row
         # and reconstructs B/A state from the scheduler's authoritative tokens.
+        self._synchronize_pending_c_to_b_copy()
         self.coordinator.release_request(rid)
 
     def note_request_aborted(self, *, rid: str) -> None:
+        self._synchronize_pending_c_to_b_copy()
         self.coordinator.release_request(rid)
 
     def _verify_with_c(
@@ -942,7 +1097,7 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             c_cache_locs=c_cache_locs,
             b_cache_locs=b_cache_locs,
         )
-        self._decode_timer.mark("c_to_b_kv_copy")
+        self._decode_timer.mark("c_to_b_kv_copy_launch")
         logits_output.hidden_states = None
         next_draft_input = make_draft_input_v2(
             bonus_tokens=bonus,
@@ -1026,7 +1181,7 @@ class HierarchicalSpecWorker(BaseSpecWorker):
     def _copy_c_kv_to_b_cache(
         self, *, c_cache_locs: torch.Tensor, b_cache_locs: torch.Tensor
     ) -> None:
-        """Copy the full C verify window into B's cache at the outer boundary.
+        """Launch the full C verify-window copy on B's side stream.
 
         The copy covers the whole fixed verify window. B's committed sequence
         length still determines which rows are read on the next forward, so
@@ -1042,6 +1197,11 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             )
         if c_cache_locs.numel() == 0:
             return
+        if self._c_to_b_copy_done_event is not None:
+            # A one-round cascade has no following B verify. In that case the
+            # previous handoff is not consumed by a B callback, so retire it
+            # here before reusing the single copy stream state.
+            self._synchronize_pending_c_to_b_copy()
         metadata = self._c_to_b_kv_copy_metadata
         if metadata is None:
             raise RuntimeError(
@@ -1051,55 +1211,132 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         src_strides = metadata["src_strides"]
         dst_ptrs = metadata["dst_ptrs"]
         dst_strides = metadata["dst_strides"]
+        copy_stream = self._c_to_b_copy_stream
+        if copy_stream is None:
+            raise RuntimeError(
+                "HierarchicalSpec C->B KV copy stream was not initialized"
+            )
+        device_module = torch.get_device_module(self.device)
+        current_stream = device_module.current_stream(self.device)
+        c_kv_ready = device_module.Event()
+        copy_done = device_module.Event()
+        timing_start = (
+            device_module.Event(enable_timing=True)
+            if self._decode_timer.enabled
+            else None
+        )
+        timing_end = (
+            device_module.Event(enable_timing=True)
+            if self._decode_timer.enabled
+            else None
+        )
         # The pools are allocated with the same page-size-one NHD geometry in
         # the supported v1 topology. Keep the location tensors on device and
-        # use one fused kernel launch per chunk, rather than a Python loop over
-        # layers and K/V tensors.
+        # use one fused kernel launch, rather than a Python loop over layers.
         c_cache_locs = c_cache_locs.reshape(-1).to(torch.int64)
         b_cache_locs = b_cache_locs.reshape(-1).to(torch.int64)
-        copy_all_layer_kv_cache_cross_pool_func(
-            src_data_ptrs=src_ptrs,
-            src_strides=src_strides,
-            dst_data_ptrs=dst_ptrs,
-            dst_strides=dst_strides,
-            tgt_loc=b_cache_locs,
-            src_loc=c_cache_locs,
-            num_locs=int(c_cache_locs.numel()),
-            kv_copy_config={
-                "bytes_per_tile": 128,
-                "byte_tiles": (metadata["row_bytes"] + 127) // 128,
-                "num_warps": 4,
-                "num_locs_upper": 256,
-            },
-        )
+        c_kv_ready.record(current_stream)
+        copy_stream.wait_event(c_kv_ready)
+        with device_module.stream(copy_stream):
+            if timing_start is not None:
+                timing_start.record(copy_stream)
+            copy_all_layer_kv_cache_cross_pool_func(
+                src_data_ptrs=src_ptrs,
+                src_strides=src_strides,
+                dst_data_ptrs=dst_ptrs,
+                dst_strides=dst_strides,
+                tgt_loc=b_cache_locs,
+                src_loc=c_cache_locs,
+                num_locs=int(c_cache_locs.numel()),
+                kv_copy_config={
+                    "bytes_per_tile": 128,
+                    "byte_tiles": (metadata["row_bytes"] + 127) // 128,
+                    "num_warps": 4,
+                    "num_locs_upper": 256,
+                },
+            )
+            if timing_end is not None:
+                timing_end.record(copy_stream)
+            copy_done.record(copy_stream)
+        c_cache_locs.record_stream(copy_stream)
+        b_cache_locs.record_stream(copy_stream)
+        self._c_to_b_copy_done_event = copy_done
+        self._pending_c_to_b_copy_timing = (timing_start, timing_end)
+
+    def _wait_for_pending_c_to_b_copy(self) -> None:
+        """Order B round 1 after the previous C->B copy.
+
+        The callback is invoked after A round 1, so A can consume the hidden
+        states already published by the previous C verify while target-KV
+        transfer proceeds independently.
+        """
+        done = self._c_to_b_copy_done_event
+        if done is None:
+            return
+        device_module = torch.get_device_module(self.device)
+        current_stream = device_module.current_stream(self.device)
+        self._decode_timer.aux_start("b_wait_for_c_to_b_kv_copy", stream=current_stream)
+        current_stream.wait_event(done)
+        self._decode_timer.aux_end("b_wait_for_c_to_b_kv_copy", stream=current_stream)
+        timing = self._pending_c_to_b_copy_timing
+        if timing is not None and timing[0] is not None and timing[1] is not None:
+            self._decode_timer.defer_aux("c_to_b_kv_copy_async", timing[0], timing[1])
+        self._c_to_b_copy_done_event = None
+        self._pending_c_to_b_copy_timing = None
+
+    def _synchronize_pending_c_to_b_copy(self) -> None:
+        """Finish an outstanding copy before releasing or rebuilding B KV."""
+        done = self._c_to_b_copy_done_event
+        if done is not None:
+            done.synchronize()
+        self._c_to_b_copy_done_event = None
+        self._pending_c_to_b_copy_timing = None
 
     def _prepare_b_decode_window(self, batch):
         b_batch = self.intermediate_stage.make_batch_view(batch)
         if batch.seq_lens_cpu is None:
             raise RuntimeError("HierarchicalSpec requires CPU seq_lens metadata")
-        self.intermediate_stage.trim_to_lengths(batch.reqs, batch.seq_lens_cpu)
-        self.intermediate_stage.update_committed_lengths(batch.reqs, batch.seq_lens_cpu)
         _, allocator = self.intermediate_worker.get_memory_pool()
         if allocator.page_size != 1:
             raise NotImplementedError(
                 "HierarchicalSpec v1 currently requires page_size=1 for the "
                 "independent B rollback allocator"
             )
-        bs = batch.batch_size()
-        slots = allocator.alloc(bs * self.outer_block_size)
-        if slots is None:
-            raise RuntimeError(
-                "HierarchicalSpec B KV cache is out of memory while reserving "
-                f"{bs * self.outer_block_size} tokens"
-            )
-        slots_2d = slots.view(bs, self.outer_block_size)
-        positions = batch.seq_lens[:, None] + self._outer_position_offsets[None, :]
         b_pool, _ = self.intermediate_worker.get_memory_pool()
-        b_pool.req_to_token[b_batch.req_pool_indices[:, None], positions] = slots_2d.to(
-            torch.int32
+        self._decode_timer.aux_start("b_window_roll")
+        slots_2d = (
+            self.intermediate_stage.roll_decode_window(
+                batch.reqs,
+                batch.seq_lens_cpu,
+                width=self.outer_block_size,
+                req_pool_indices=b_batch.req_pool_indices,
+            )
+            if self.use_c_to_b_kv_handoff
+            else None
         )
-        allocated_cpu = batch.seq_lens_cpu + self.outer_block_size
-        self.intermediate_stage.update_cache_lengths(batch.reqs, allocated_cpu)
+        if slots_2d is None:
+            self._synchronize_pending_c_to_b_copy()
+            self.intermediate_stage.trim_to_lengths(batch.reqs, batch.seq_lens_cpu)
+            self.intermediate_stage.update_committed_lengths(
+                batch.reqs, batch.seq_lens_cpu
+            )
+            bs = batch.batch_size()
+            slots = allocator.alloc(bs * self.outer_block_size)
+            if slots is None:
+                raise RuntimeError(
+                    "HierarchicalSpec B KV cache is out of memory while reserving "
+                    f"{bs * self.outer_block_size} tokens"
+                )
+            slots_2d = slots.view(bs, self.outer_block_size)
+            positions = batch.seq_lens[:, None] + self._outer_position_offsets[None, :]
+            b_pool.req_to_token[b_batch.req_pool_indices[:, None], positions] = (
+                slots_2d.to(torch.int32)
+            )
+            allocated_cpu = batch.seq_lens_cpu + self.outer_block_size
+            self.intermediate_stage.update_cache_lengths(batch.reqs, allocated_cpu)
+        else:
+            allocated_cpu = batch.seq_lens_cpu + self.outer_block_size
+        self._decode_timer.aux_end("b_window_roll")
 
         draft_input = batch.spec_info
         if draft_input is None or not hasattr(draft_input, "bonus_tokens"):
@@ -1177,6 +1414,9 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         return b_batch, slots
 
     def _forward_prefill(self, batch, *, pp_proxy_tensors=None):
+        # Prefill may reuse C or B physical slots before there is an A1/B1
+        # boundary at which the rolling decode path would consume the event.
+        self._synchronize_pending_c_to_b_copy()
         # C remains authoritative for the sampled token and scheduler-visible
         # result. Capture its hidden states before B runs.
         c_result = self.target_worker.forward_batch_generation(
@@ -1283,6 +1523,11 @@ class HierarchicalSpecWorker(BaseSpecWorker):
                 )
                 if self._decode_timer.enabled
                 else None,
+                on_before_target_verify=(
+                    self._wait_for_pending_c_to_b_copy
+                    if round_index == 0 and self.use_c_to_b_kv_handoff
+                    else None
+                ),
             )
             round_width = (
                 self.inner_block_size - 1 if skip_b_verify else self.inner_block_size

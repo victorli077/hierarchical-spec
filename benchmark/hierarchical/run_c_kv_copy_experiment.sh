@@ -48,7 +48,7 @@ Experiment outputs:
   summary:   ${EXPERIMENT_ROOT}/c_kv_copy_comparison.md
 
 Compare the HierarchicalSpec sections for:
-  - accept length / accepted tokens
-  - c_to_b_kv_copy timing
+  - accept length / accept tokens
+  - c_to_b_kv_copy_async and b_wait_for_c_to_b_kv_copy timing
   - b_round_* timing and total latency
 EOF

@@ -31,6 +31,13 @@ The three-way wrapper is `benchmark/hierarchical/run_sglang_benchmark.sh`; its d
 
 Reports are written under `benchmark/hierarchical/outputs/`. Record graph mode, K/L, acceptance length, verification counts, throughput, latency, and KV-capacity effects when comparing configurations. The B-only graph run should report B graph replays with zero fallbacks, an eager A draft path, and an eager C target path.
 
+For apples-to-apples comparisons with HierarchicalSpec, set
+`DISABLE_OVERLAP_SCHEDULE=1` in `run_sglang_benchmark.sh` (or pass
+`--disable-overlap-schedule` to `benchmark_three_way.py`). The switch is applied
+to ABC, AC, and C-only server launches; it disables the scheduler's cross-batch
+CPU/GPU overlap without changing the speculative algorithm or CUDA Graph role
+settings.
+
 For HierarchicalSpec A and B, the graph captures the model forward and still
 uses FlashInfer's direct `fast_prefill_plan`. Both workers reserve storage for
 the complete outer window, so their host `seq_lens_cpu` can be an allocation
@@ -53,19 +60,31 @@ row strides in B and C. This is the optimized cache handoff: B verifies only the
 first `K-1` inner rounds, the final A proposals go directly to C, and C's `K*L`
 rows replace B's reserved window at the outer boundary. The copy includes
 rejected suffix rows; B's committed sequence length controls which rows are
-subsequently read. The timing reporter exposes the fused operation as
-`c_to_b_kv_copy`.
+subsequently read. The copy is launched on a dedicated CUDA stream after C
+completes, while the next A round starts immediately from the already-published
+C hidden states. The next B round waits on the copy event only after A has
+finished. The timing reporter separates `c_to_b_kv_copy_launch`, asynchronous
+`c_to_b_kv_copy_async`, `b_wait_for_c_to_b_kv_copy`, and `b_window_roll`.
+
+With the handoff enabled, B's fixed window advances as a committed-prefix plus
+new-tail allocation: rows that leave the speculative window are already valid
+committed KV and remain allocated, while only the newly exposed tail is
+allocated. The first decode or any rollback/regression uses the conservative
+trim-and-rebuild path. Request release and cache reset synchronize an outstanding
+copy before returning physical slots to the allocator.
 Use `benchmark/hierarchical/run_c_kv_copy_experiment.sh` to run matched
 baseline and copy-enabled cases in separate output directories and compare
-`accept_length`, `c_to_b_kv_copy`, and end-to-end time. The script writes the
+`accept_length`, `c_to_b_kv_copy_async`, and end-to-end time. The script writes the
 comparison to `c_kv_copy_comparison.md` and `.json` under the experiment root.
 
 The wrapper can enable `SGLANG_LOG_HIERARCHICAL_TIMING=1`. During the
 A+B+C run, CUDA events split each outer decode into B cache preparation and
 rollback, candidate-buffer setup/finalization, every A draft and B verification
 round, and C verification plus hidden-state publication. A
-single synchronization at the end of the outer decode makes the event durations
-available. Logs report interval averages and percentages, separate
+single synchronization of the main stream at the end of the outer decode makes
+the linear event durations available; the asynchronous copy event is consumed
+by the next B1 wait before its duration is reported. Logs report interval
+averages and percentages, separate
 `a_rounds_total` and `b_rounds_total` aggregates, plus an unattributed
 host/launch/sync residual. Set `HIERARCHICAL_TIMING=0` to measure uninstrumented
 throughput or `HIERARCHICAL_TIMING_INTERVAL=1` to print every outer decode batch.

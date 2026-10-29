@@ -9,7 +9,7 @@ import re
 import statistics
 from pathlib import Path
 
-COPY_TIME_RE = re.compile(r"c_to_b_kv_copy=([0-9.]+) ms")
+COPY_TIME_RE = re.compile(r"c_to_b_kv_copy_async=([0-9.]+) ms")
 
 
 def load_rows(path: Path) -> dict[tuple[str, int], dict]:
@@ -84,19 +84,19 @@ def main() -> None:
             "max_ms": max(copy_times),
         }
         lines.append(
-            f"`c_to_b_kv_copy`: mean {timing['mean_ms']:.3f} ms, "
+            f"`c_to_b_kv_copy_async`: mean {timing['mean_ms']:.3f} ms, "
             f"median {timing['median_ms']:.3f} ms, min {timing['min_ms']:.3f} ms, "
             f"max {timing['max_ms']:.3f} ms over {timing['num_reports']} reports."
         )
     else:
         timing = None
-        lines.append("No `c_to_b_kv_copy` timing samples were found.")
+        lines.append("No `c_to_b_kv_copy_async` timing samples were found.")
 
     report = "\n".join(lines) + "\n"
     (root / "c_kv_copy_comparison.md").write_text(report, encoding="utf-8")
     (root / "c_kv_copy_comparison.json").write_text(
         json.dumps(
-            {"rows": output_rows, "c_to_b_kv_copy_timing": timing},
+            {"rows": output_rows, "c_to_b_kv_copy_async_timing": timing},
             indent=2,
             ensure_ascii=False,
         )

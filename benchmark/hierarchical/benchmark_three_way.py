@@ -421,6 +421,8 @@ def server_args(args: argparse.Namespace, mode: str) -> list[str]:
         "--page-size",
         str(args.page_size),
     ]
+    if args.disable_overlap_schedule:
+        result.append("--disable-overlap-schedule")
     if args.disable_radix_cache:
         result.append("--disable-radix-cache")
     # Historically the ABC benchmark disabled CUDA graphs unconditionally so
@@ -557,6 +559,7 @@ def write_mode_report(
                     "top_p": args.top_p,
                     "top_k": args.top_k,
                     "max_new_tokens": args.max_new_tokens,
+                    "disable_overlap_schedule": args.disable_overlap_schedule,
                     **asdict(metric),
                 }
             )
@@ -575,6 +578,7 @@ def write_mode_report(
         f"- block_size: `{args.dflash_block_size}`",
         f"- dtype: `{args.dtype}`, temperature: `{args.temperature}`, top_p: `{args.top_p}`, top_k: `{args.top_k}`",
         f"- warmup_requests: `{args.warmup_requests}`, warmup_max_new_tokens: `{args.warmup_max_new_tokens}`, skip_first_requests: `{args.skip_first_requests}`",
+        f"- disable_overlap_schedule: `{args.disable_overlap_schedule}`",
         "",
         "| dataset | requests | concurrency | output tokens | latency (s) | tok/s | accept length | verify count |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -694,6 +698,11 @@ def main() -> None:
     parser.add_argument("--timeout-s", type=int, default=3600)
     parser.add_argument("--disable-radix-cache", action="store_true")
     parser.add_argument("--disable-cuda-graph", action="store_true")
+    parser.add_argument(
+        "--disable-overlap-schedule",
+        action="store_true",
+        help="Run every benchmark mode with synchronous scheduling (no overlap).",
+    )
     parser.add_argument("--batch-requests", action="store_true")
     parser.add_argument("--output-dir", type=Path, default=None)
     args = parser.parse_args()
