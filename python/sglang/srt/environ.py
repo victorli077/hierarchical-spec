@@ -356,10 +356,22 @@ class Envs:
     SGLANG_LOG_REQUEST_HEADERS = EnvTuple(tuple())
     SGLANG_LOG_SCHEDULER_STATUS_TARGET = EnvStr("")
     SGLANG_LOG_SCHEDULER_STATUS_INTERVAL = EnvFloat(60.0)
-    # Opt-in CUDA-event breakdown for HierarchicalSpec decode. The interval is
-    # the number of outer decode batches accumulated into each log record.
+    # Opt-in CUDA-event breakdown for HierarchicalSpec and standalone DFlash
+    # A+C decode. The interval is the number of decode batches accumulated
+    # into each log record.
     SGLANG_LOG_HIERARCHICAL_TIMING = EnvBool(False)
     SGLANG_LOG_HIERARCHICAL_TIMING_INTERVAL = EnvInt(40)
+    # Opt-in CUDA Graph capture for HierarchicalSpec's auxiliary B target.
+    # The default remains eager because B uses a separate target-verify graph
+    # contract from the outer C verify path.
+    SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH = EnvBool(False)
+    # Opt-in CUDA Graph capture for HierarchicalSpec's A DFlash drafter.
+    # A and B are independent graph roles so either can be benchmarked in
+    # isolation before enabling both together.
+    SGLANG_ENABLE_HIERARCHICAL_A_CUDA_GRAPH = EnvBool(False)
+    # Opt-in CUDA Graph capture for HierarchicalSpec's outer C target verify.
+    # C uses the fixed K*L outer width and is independent from A/B graphs.
+    SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH = EnvBool(False)
     # HierarchicalSpec outer-boundary handoff: skip the final B verify and copy
     # C's verify-window KV rows into B's independent cache. Set to false for
     # the legacy K-B-verify path or matched A/B experiments.

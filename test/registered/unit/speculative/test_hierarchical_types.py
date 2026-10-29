@@ -1,3 +1,4 @@
+import logging
 from types import SimpleNamespace
 
 import pytest
@@ -5,11 +6,22 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _handle_hierarchical
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.flashinfer_backend import (
+    _resolve_fast_verify_host_lens,
+)
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+    resolve_hierarchical_graph_flags,
+)
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.dflash_worker_v2 import _DFlashTimingReporter
 from sglang.srt.speculative.hierarchical_config import (
     cascade_pending_width,
     cascade_verify_width,
+    hierarchical_b_uses_dynamic_verify_plan,
+    hierarchical_model_verify_width,
+    hierarchical_uses_dynamic_verify_plan,
     parse_device_map,
     validate_hierarchical_request,
 )
@@ -34,6 +46,40 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+def test_dflash_ac_timing_reporter_aggregates_a_and_c(caplog):
+    stages = [
+        "a_draft",
+        "c_verify_setup",
+        "c_model_verify",
+        "c_accept_postprocess",
+        "c_hidden_publish",
+        "c_result_finalize",
+    ]
+    reporter = _DFlashTimingReporter(enabled=True, interval=2, stage_names=stages)
+    sample = {
+        "a_draft": 2.0,
+        "c_verify_setup": 1.0,
+        "c_model_verify": 3.0,
+        "c_accept_postprocess": 1.0,
+        "c_hidden_publish": 1.0,
+        "c_result_finalize": 0.5,
+        "host_launch_sync_residual": 1.5,
+        "total": 10.0,
+    }
+
+    with caplog.at_level(logging.INFO):
+        reporter.add(sample, batch_size=4, a_graph_replay=True, c_graph_replay=False)
+        assert "DFlash A+C timing:" not in caplog.text
+        reporter.add(sample, batch_size=8, a_graph_replay=False, c_graph_replay=True)
+
+    assert "DFlash A+C timing: samples=2, latest_bs=8" in caplog.text
+    assert "a_total=2.000 ms (20.0%)" in caplog.text
+    assert "c_total=6.500 ms (65.0%)" in caplog.text
+    assert "a_graph_replays=1 a_graph_fallbacks=1" in caplog.text
+    assert "c_graph_replays=1 c_graph_fallbacks=1" in caplog.text
+    assert reporter._count == 0
 
 
 def _state(batch=2, width=4):
@@ -263,6 +309,50 @@ def test_hierarchical_dflash_block_size_reaches_worker_field():
     )
 
 
+def test_hierarchical_model_graph_widths():
+    kwargs = {"inner_block_size": 8, "rounds": 3}
+    assert (
+        hierarchical_model_verify_width(
+            **kwargs, is_auxiliary_target=False, is_draft_worker=True
+        )
+        == 8
+    )
+    assert (
+        hierarchical_model_verify_width(
+            **kwargs, is_auxiliary_target=True, is_draft_worker=False
+        )
+        == 8
+    )
+    assert (
+        hierarchical_model_verify_width(
+            **kwargs, is_auxiliary_target=False, is_draft_worker=False
+        )
+        == 24
+    )
+
+
+@pytest.mark.parametrize(
+    ("is_hierarchical", "is_auxiliary_target", "is_draft_worker", "expected"),
+    [
+        (True, True, False, True),
+        (True, False, False, False),
+        (True, False, True, False),
+        (False, True, False, False),
+    ],
+)
+def test_hierarchical_b_uses_dynamic_verify_plan(
+    is_hierarchical, is_auxiliary_target, is_draft_worker, expected
+):
+    assert (
+        hierarchical_b_uses_dynamic_verify_plan(
+            is_hierarchical=is_hierarchical,
+            is_auxiliary_target=is_auxiliary_target,
+            is_draft_worker=is_draft_worker,
+        )
+        is expected
+    )
+
+
 def test_hierarchical_dflash_block_size_defaults_and_rejects_conflict():
     default_args = _hierarchical_server_args()
     _handle_hierarchical(default_args)
@@ -274,6 +364,185 @@ def test_hierarchical_dflash_block_size_defaults_and_rejects_conflict():
     )
     with pytest.raises(ValueError, match="they differ"):
         _handle_hierarchical(conflict_args)
+
+
+def test_hierarchical_b_cuda_graph_is_opt_in():
+    eager_args = _hierarchical_server_args()
+    _handle_hierarchical(eager_args)
+    assert resolution_result(eager_args, "disable_cuda_graph") is True
+
+    graph_args = _hierarchical_server_args(device="cuda")
+    with envs.SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH.override(True):
+        _handle_hierarchical(graph_args)
+    assert resolution_result(graph_args, "disable_cuda_graph") is False
+    assert resolution_result(graph_args, "disable_decode_cuda_graph") is False
+    assert resolution_result(graph_args, "disable_prefill_cuda_graph") is False
+
+
+def test_hierarchical_b_cuda_graph_requires_cuda():
+    args = _hierarchical_server_args(device="cpu")
+    with envs.SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH.override(True):
+        _handle_hierarchical(args)
+    assert resolution_result(args, "disable_cuda_graph") is True
+
+
+@pytest.mark.parametrize(
+    ("is_auxiliary_target", "is_draft_worker", "expected"),
+    [
+        (False, False, (False, False)),  # C stays fully eager.
+        (True, False, (True, False)),  # B keeps only target-verify decode graph.
+        (False, True, (False, False)),  # A is independently opt-in.
+    ],
+)
+def test_hierarchical_role_graph_worker_roles(
+    is_auxiliary_target, is_draft_worker, expected
+):
+    with envs.SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH.override(True):
+        actual = resolve_hierarchical_graph_flags(
+            is_hierarchical=True,
+            is_auxiliary_target=is_auxiliary_target,
+            is_draft_worker=is_draft_worker,
+            capture_decode_cuda_graph=True,
+        )
+    assert actual == expected
+
+
+@pytest.mark.parametrize(
+    ("is_auxiliary_target", "is_draft_worker", "expected"),
+    [(True, False, True), (False, True, True), (False, False, False)],
+)
+def test_hierarchical_a_or_b_uses_dynamic_verify_plan(
+    is_auxiliary_target, is_draft_worker, expected
+):
+    assert (
+        hierarchical_uses_dynamic_verify_plan(
+            is_hierarchical=True,
+            is_auxiliary_target=is_auxiliary_target,
+            is_draft_worker=is_draft_worker,
+        )
+        is expected
+    )
+
+
+def test_hierarchical_c_cuda_graph_is_opt_in():
+    args = _hierarchical_server_args(device="cuda")
+    with envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.override(True):
+        _handle_hierarchical(args)
+    assert resolution_result(args, "disable_cuda_graph") is False
+    assert resolution_result(args, "disable_decode_cuda_graph") is False
+    assert resolution_result(args, "disable_prefill_cuda_graph") is False
+
+
+def test_hierarchical_c_graph_role_is_decode_only():
+    with envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.override(True):
+        actual = resolve_hierarchical_graph_flags(
+            is_hierarchical=True,
+            is_auxiliary_target=False,
+            is_draft_worker=False,
+            capture_decode_cuda_graph=True,
+            capture_prefill_cuda_graph=True,
+        )
+    assert actual == (True, False)
+
+
+def test_hierarchical_role_graph_policy_is_opt_in():
+    with (
+        envs.SGLANG_ENABLE_HIERARCHICAL_A_CUDA_GRAPH.override(False),
+        envs.SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH.override(False),
+        envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.override(False),
+    ):
+        actual = resolve_hierarchical_graph_flags(
+            is_hierarchical=True,
+            is_auxiliary_target=False,
+            is_draft_worker=False,
+            capture_decode_cuda_graph=True,
+        )
+    assert actual == (True, True)
+
+
+@pytest.mark.parametrize(
+    ("a_enabled", "b_enabled", "c_enabled", "expected"),
+    [
+        (True, False, False, ((False, False), (True, True), (False, False))),
+        (True, True, False, ((False, False), (True, True), (True, False))),
+        (False, False, True, ((True, False), (False, False), (False, False))),
+    ],
+)
+def test_hierarchical_graph_role_selection(a_enabled, b_enabled, c_enabled, expected):
+    with (
+        envs.SGLANG_ENABLE_HIERARCHICAL_A_CUDA_GRAPH.override(a_enabled),
+        envs.SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH.override(b_enabled),
+        envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.override(c_enabled),
+    ):
+        c_flags = resolve_hierarchical_graph_flags(
+            is_hierarchical=True,
+            is_auxiliary_target=False,
+            is_draft_worker=False,
+            capture_decode_cuda_graph=True,
+        )
+        a_flags = resolve_hierarchical_graph_flags(
+            is_hierarchical=True,
+            is_auxiliary_target=False,
+            is_draft_worker=True,
+            capture_decode_cuda_graph=True,
+        )
+        b_flags = resolve_hierarchical_graph_flags(
+            is_hierarchical=True,
+            is_auxiliary_target=True,
+            is_draft_worker=False,
+            capture_decode_cuda_graph=True,
+        )
+    assert (c_flags, a_flags, b_flags) == expected
+
+
+def test_hierarchical_b_graph_capture_error_installs_complete_eager_fallback():
+    eager_runner = object()
+    model_runner = SimpleNamespace(decode_cuda_graph_captured=True)
+
+    class IntermediateWorker:
+        def __init__(self):
+            self.model_runner = model_runner
+            self.capture_attempts = []
+
+        def init_cuda_graphs(self, capture_decode_cuda_graph=True):
+            self.capture_attempts.append(capture_decode_cuda_graph)
+            if capture_decode_cuda_graph:
+                raise RuntimeError("synthetic B graph capture error")
+            model_runner.eager_runner = eager_runner
+            model_runner.prefill_cuda_graph_runner = eager_runner
+            model_runner.decode_cuda_graph_runner = eager_runner
+
+    class InnerDFlash:
+        graph_initialized = False
+
+        def init_cuda_graphs(self):
+            self.graph_initialized = True
+
+    worker = object.__new__(HierarchicalSpecWorker)
+    worker.intermediate_worker = IntermediateWorker()
+    worker.inner_dflash = InnerDFlash()
+    worker._b_cuda_graph_capture_failed = False
+
+    worker.init_cuda_graphs()
+
+    assert worker._b_cuda_graph_capture_failed
+    assert worker.intermediate_worker.capture_attempts == [True, False]
+    assert model_runner.prefill_cuda_graph_runner is eager_runner
+    assert model_runner.decode_cuda_graph_runner is eager_runner
+    assert model_runner.decode_cuda_graph_captured is False
+    assert worker.inner_dflash.graph_initialized
+
+
+def test_hierarchical_b_fast_verify_plan_uses_live_prefix_plus_width():
+    live_prefix = torch.tensor([10, 13], device="cpu", dtype=torch.int64)
+    allocation_bound = torch.tensor([34, 37], dtype=torch.int32)
+    result = _resolve_fast_verify_host_lens(
+        paged_kernel_lens=live_prefix,
+        seq_lens_cpu=allocation_bound,
+        num_tokens_per_req=8,
+        hierarchical_dynamic=True,
+    )
+    assert result.tolist() == [18, 21]
 
 
 def test_v1_request_validation_rejects_unsupported_features():

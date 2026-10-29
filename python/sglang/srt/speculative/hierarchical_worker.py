@@ -134,11 +134,28 @@ class _HierarchicalTimingReporter:
         self.stage_names = [*stage_names, "host_launch_sync_residual"]
         self._count = 0
         self._totals: dict[str, float] = defaultdict(float)
+        self._b_graph_replays = 0
+        self._b_graph_fallbacks = 0
+        self._c_graph_replays = 0
+        self._c_graph_fallbacks = 0
 
-    def add(self, sample: dict[str, float], *, batch_size: int) -> None:
+    def add(
+        self,
+        sample: dict[str, float],
+        *,
+        batch_size: int,
+        b_graph_replays: int = 0,
+        b_graph_fallbacks: int = 0,
+        c_graph_replays: int = 0,
+        c_graph_fallbacks: int = 0,
+    ) -> None:
         if not self.enabled:
             return
         self._count += 1
+        self._b_graph_replays += int(b_graph_replays)
+        self._b_graph_fallbacks += int(b_graph_fallbacks)
+        self._c_graph_replays += int(c_graph_replays)
+        self._c_graph_fallbacks += int(c_graph_fallbacks)
         for name in [*self.stage_names, "total"]:
             self._totals[name] += float(sample.get(name, 0.0))
         if self._count < self.interval:
@@ -160,12 +177,18 @@ class _HierarchicalTimingReporter:
         a_round_share = 100.0 * a_round_ms / total_ms if total_ms > 0 else 0.0
         logger.info(
             "HierarchicalSpec timing: samples=%d, latest_bs=%d, avg_total=%.3f ms | "
-            "%s | a_rounds_total=%.3f ms (%.1f%%) | "
+            "%s | b_graph_replays=%d b_graph_fallbacks=%d | "
+            "c_graph_replays=%d c_graph_fallbacks=%d | "
+            "a_rounds_total=%.3f ms (%.1f%%) | "
             "b_rounds_total=%.3f ms (%.1f%%)",
             self._count,
             batch_size,
             total_ms,
             " | ".join(parts),
+            self._b_graph_replays,
+            self._b_graph_fallbacks,
+            self._c_graph_replays,
+            self._c_graph_fallbacks,
             a_round_ms,
             a_round_share,
             round_ms,
@@ -173,6 +196,10 @@ class _HierarchicalTimingReporter:
         )
         self._count = 0
         self._totals.clear()
+        self._b_graph_replays = 0
+        self._b_graph_fallbacks = 0
+        self._c_graph_replays = 0
+        self._c_graph_fallbacks = 0
 
 
 def build_intermediate_tp_worker(
@@ -448,6 +475,7 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             interval=envs.SGLANG_LOG_HIERARCHICAL_TIMING_INTERVAL.get(),
             stage_names=self._timing_stage_names,
         )
+        self._b_cuda_graph_capture_failed = False
         if timing_enabled:
             logger.warning(
                 "HierarchicalSpec CUDA timing is enabled (report interval=%d); "
@@ -470,6 +498,7 @@ class HierarchicalSpecWorker(BaseSpecWorker):
             gpu_id=gpu_id,
             nccl_port=nccl_port,
             target_worker=intermediate_worker,
+            timing_enabled=False,
         )
         self.coordinator = CascadeCoordinator(
             intermediate_stage=IntermediateStage(intermediate_worker),
@@ -748,8 +777,47 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         self.inner_dflash.init_attention_backends()
 
     def init_cuda_graphs(self):
-        self.intermediate_worker.init_cuda_graphs()
+        # B is an auxiliary target and captures a normal target-verify graph
+        # with width L.  Keep startup resilient: graph capture is an optional
+        # optimization, while the eager worker remains a correct fallback.
+        try:
+            self.intermediate_worker.init_cuda_graphs()
+        except Exception:
+            self._b_cuda_graph_capture_failed = True
+            logger.exception(
+                "HierarchicalSpec B CUDA Graph capture failed; falling back to "
+                "eager B target verify."
+            )
+            # ``ModelRunner.init_cuda_graphs`` assigns eager/prefill/decode
+            # runners only after capture_cuda_graphs() returns.  If capture
+            # throws part-way through, those attributes do not exist yet and
+            # the next prefill would fail while checking the prefill runner.
+            # Re-run initialization with graph capture explicitly disabled so
+            # the normal capture helper installs a complete eager fallback
+            # (including prefill_cuda_graph_runner and graph bookkeeping).
+            self.intermediate_worker.init_cuda_graphs(capture_decode_cuda_graph=False)
+            # The generic initializer points the disabled decode slot at the
+            # eager runner, so the runner's historical non-null test would
+            # otherwise report a graph as captured and skip future recapture.
+            self.intermediate_worker.model_runner.decode_cuda_graph_captured = False
         self.inner_dflash.init_cuda_graphs()
+        if self._b_cuda_graph_capture_failed:
+            logger.warning(
+                "HierarchicalSpec B CUDA Graph is unavailable; B will use eager "
+                "target verify while A/C retain their independently selected modes."
+            )
+        else:
+            model_runner = self.intermediate_worker.model_runner
+            if (
+                model_runner.decode_cuda_graph_runner is not None
+                and model_runner.decode_cuda_graph_runner
+                is not model_runner.eager_runner
+            ):
+                logger.info(
+                    "HierarchicalSpec B CUDA Graph captured: width=%d, capture_bs=%s",
+                    model_runner.decode_num_tokens_per_req(),
+                    model_runner.decode_cuda_graph_capture_bs,
+                )
 
     def clear_cache_pool(self):
         self.coordinator.clear_cache_pool()
@@ -1178,6 +1246,8 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         )
         candidate_chain[:, 0].copy_(b_batch.spec_info.bonus_tokens)
         pending_lens = torch.zeros((bs,), dtype=torch.int64, device=self.device)
+        b_graph_replays = 0
+        b_graph_fallbacks = 0
         round_offsets = torch.arange(
             self.inner_block_size, dtype=torch.int64, device=self.device
         )[None, :]
@@ -1254,6 +1324,10 @@ class HierarchicalSpecWorker(BaseSpecWorker):
                 b_batch.seq_lens_cpu = None
             if not skip_b_verify:
                 self._decode_timer.mark(f"b_round_{round_index + 1}")
+                if inner_result.can_run_cuda_graph:
+                    b_graph_replays += 1
+                else:
+                    b_graph_fallbacks += 1
 
         if not self.use_c_to_b_kv_handoff:
             self._materialize_b_final_recovery(b_batch)
@@ -1267,7 +1341,14 @@ class HierarchicalSpecWorker(BaseSpecWorker):
         )
         self._decode_timer.mark("c_result_finalize")
         timing_sample = self._decode_timer.finish()
-        self._timing_reporter.add(timing_sample, batch_size=bs)
+        self._timing_reporter.add(
+            timing_sample,
+            batch_size=bs,
+            b_graph_replays=b_graph_replays,
+            b_graph_fallbacks=b_graph_fallbacks,
+            c_graph_replays=int(result.can_run_cuda_graph),
+            c_graph_fallbacks=int(not result.can_run_cuda_graph),
+        )
         return result
 
     def _materialize_b_final_recovery(self, b_batch) -> None:

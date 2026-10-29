@@ -444,11 +444,47 @@ class TpModelWorker(BaseTpWorker):
 
     def init_cuda_graphs(self, capture_decode_cuda_graph: bool = True):
         """Capture cuda graphs for all model runners."""
-        self.model_runner.init_cuda_graphs(
-            capture_decode_cuda_graph=capture_decode_cuda_graph
-        )
+
+        def init_runner_graphs(mr: ModelRunner) -> None:
+            try:
+                mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+            except Exception:
+                # Hierarchical C is an opt-in optimization.  A capture failure
+                # must not terminate the scheduler, and ModelRunner's generic
+                # initializer is rerun with decode capture disabled so it
+                # installs a complete eager/prefill/decode fallback.
+                is_hierarchical_c = (
+                    mr.spec_algorithm.is_hierarchical()
+                    and not mr.is_auxiliary_target
+                    and not mr.is_draft_worker
+                    and envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.get()
+                )
+                if not is_hierarchical_c:
+                    raise
+                logger.exception(
+                    "HierarchicalSpec C CUDA Graph capture failed; falling back "
+                    "to eager outer target verify."
+                )
+                mr.init_cuda_graphs(capture_decode_cuda_graph=False)
+                mr.decode_cuda_graph_captured = False
+
+            if (
+                mr.spec_algorithm.is_hierarchical()
+                and not mr.is_auxiliary_target
+                and not mr.is_draft_worker
+                and envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.get()
+                and mr.decode_cuda_graph_runner is not None
+                and mr.decode_cuda_graph_runner is not mr.eager_runner
+            ):
+                logger.info(
+                    "HierarchicalSpec C CUDA Graph captured: width=%d, capture_bs=%s",
+                    mr.decode_num_tokens_per_req(),
+                    mr.decode_cuda_graph_capture_bs,
+                )
+
+        init_runner_graphs(self.model_runner)
         for mr in self.model_runner_list[1:]:
-            mr.init_cuda_graphs(capture_decode_cuda_graph=capture_decode_cuda_graph)
+            init_runner_graphs(mr)
 
     def ensure_decode_cuda_graphs(self, capture_bs: Optional[List[int]] = None):
         """Idempotently capture decode cuda graphs for all model runners (used

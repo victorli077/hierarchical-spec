@@ -23,13 +23,26 @@ Each stage has an independent model runner and KV pool. A and B may run ahead wi
 
 ## Supported Contract
 
-The current v1 path is linear and greedy (`temperature=0`, `top_k=1`), uses one tokenizer/vocabulary, and supports a single GPU/fixed parallel configuration. A/B/C must share one device; independent stage placement and cross-device transfers are not implemented. CUDA Graphs are disabled for HierarchicalSpec. C-only and A+C may use them unless a benchmark disables them for all modes.
+The current v1 path is linear and greedy (`temperature=0`, `top_k=1`), uses one tokenizer/vocabulary, and supports a single GPU/fixed parallel configuration. A/B/C must share one device; independent stage placement and cross-device transfers are not implemented. CUDA Graphs remain disabled by default for HierarchicalSpec. Setting `SGLANG_ENABLE_HIERARCHICAL_A_CUDA_GRAPH=1`, `SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH=1`, or `SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH=1` enables the corresponding A, B, or C graph independently. A and B use the inner width `L`; C uses the outer width `K*L` and captures FULL hidden states needed by the A handoff. The three roles capture separate graph instances for their own model runners, KV pools, hidden-state buffers, and fixed widths. Any unsupported graph capture or replay falls back to the corresponding eager path where a role-specific fallback is installed.
 
 ## Quantization and Benchmark
 
-The three-way wrapper is `benchmark/hierarchical/run_sglang_benchmark.sh`; its driver is `benchmark_three_way.py`. By default it runs A+B+C, C-only, and A+C with matched prompts and request settings; `BENCHMARK_MODES` selects a subset such as `abc`. The C-to-B KV-copy experiment fixes this to `abc`, because it needs only matched copy-off and copy-on HierarchicalSpec runs. `DTYPE` applies to every mode and defaults to BF16. Intermediate `AWQ` is normalized to `awq_marlin`, matching SGLang's BF16-capable automatic AWQ path; plain `awq` may reject BF16. Intermediate quantization values `unquant` and `none` mean that no intermediate quantization override is passed; for an unquantized target this loads B in its checkpoint-native dtype.
+The three-way wrapper is `benchmark/hierarchical/run_sglang_benchmark.sh`; its driver is `benchmark_three_way.py`. By default it runs A+B+C, C-only, and A+C with matched prompts and request settings; `BENCHMARK_MODES` selects a subset such as `abc`. The C-to-B KV-copy experiment fixes this to `abc`, because it needs only matched copy-off and copy-on HierarchicalSpec runs. `DTYPE` applies to every mode and defaults to BF16. Intermediate `AWQ` is normalized to `awq_marlin`, matching SGLang's BF16-capable automatic AWQ path; plain `awq` may reject BF16. Intermediate quantization values `unquant` and `none` mean that no intermediate quantization override is passed; for an unquantized target this loads B in its checkpoint-native dtype. The ABC benchmark keeps CUDA Graphs disabled by default for an eager baseline; set `HIERARCHICAL_A_CUDA_GRAPH=1`, `HIERARCHICAL_B_CUDA_GRAPH=1`, and/or `HIERARCHICAL_C_CUDA_GRAPH=1` (and leave `DISABLE_CUDA_GRAPH=0`) to enable the corresponding role graph path.
 
-Reports are written under `benchmark/hierarchical/outputs/`. Record graph mode, K/L, acceptance length, verification counts, throughput, latency, and KV-capacity effects when comparing configurations.
+Reports are written under `benchmark/hierarchical/outputs/`. Record graph mode, K/L, acceptance length, verification counts, throughput, latency, and KV-capacity effects when comparing configurations. The B-only graph run should report B graph replays with zero fallbacks, an eager A draft path, and an eager C target path.
+
+For HierarchicalSpec A and B, the graph captures the model forward and still
+uses FlashInfer's direct `fast_prefill_plan`. Both workers reserve storage for
+the complete outer window, so their host `seq_lens_cpu` can be an allocation
+upper bound while each inner round has a shorter live prefix. Before an A/B
+replay, the fast-plan path uses the live device prefix plus the fixed inner
+query width as its host planning length, rather than the allocation bound. C
+uses its outer verify layout and can now opt into its own graph with
+`SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH=1`; its graph captures FULL hidden
+states for the A handoff. The dynamic A/B path performs one live-prefix
+device-to-host metadata read per replay instead of rebuilding the regular
+planner, preventing attention from reading provisional or uninitialized KV
+rows.
 
 When `SGLANG_ENABLE_HIERARCHICAL_C_KV_COPY=1`, the outer boundary copies the
 complete fixed C verify window into B's corresponding physical slots. The
@@ -56,6 +69,14 @@ available. Logs report interval averages and percentages, separate
 `a_rounds_total` and `b_rounds_total` aggregates, plus an unattributed
 host/launch/sync residual. Set `HIERARCHICAL_TIMING=0` to measure uninstrumented
 throughput or `HIERARCHICAL_TIMING_INTERVAL=1` to print every outer decode batch.
+
+The same environment switch is also honored by standalone DFlash A+C runs.
+Those logs are prefixed `DFlash A+C timing` and split each decode into the A
+draft, C verify setup, C model verify, acceptance/post-processing, hidden-state
+publication, result finalization, and host/launch/synchronization residual.
+When HierarchicalSpec embeds DFlash for its A-to-B rounds, timing is disabled
+on that nested worker so only the outer `HierarchicalSpec timing` record is
+emitted.
 
 ## Code Map and Tests
 

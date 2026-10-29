@@ -64,6 +64,71 @@ logger = logging.getLogger(__name__)
 _deep_gemm_layout_memory_budget_initialized = False
 
 
+def resolve_hierarchical_graph_flags(
+    *,
+    is_hierarchical: bool,
+    is_auxiliary_target: bool,
+    is_draft_worker: bool,
+    capture_decode_cuda_graph: bool,
+    capture_prefill_cuda_graph: bool = True,
+) -> tuple[bool, bool]:
+    """Resolve CUDA Graph capture independently for HierarchicalSpec roles.
+
+    A (DFlash), B (auxiliary target), and C (outer target) have independent
+    fixed-width graph contracts. C is opt-in because its outer verify graph
+    must capture FULL hidden states for the A handoff.
+    """
+    if not is_hierarchical:
+        return capture_decode_cuda_graph, capture_prefill_cuda_graph
+
+    a_enabled = envs.SGLANG_ENABLE_HIERARCHICAL_A_CUDA_GRAPH.get()
+    b_enabled = envs.SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH.get()
+    c_enabled = envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.get()
+    if not (a_enabled or b_enabled or c_enabled):
+        # The HierarchicalSpec argument hook normally disables graphs before
+        # this point. Preserve generic resolver semantics for direct callers
+        # with no role-specific opt-in.
+        return capture_decode_cuda_graph, capture_prefill_cuda_graph
+
+    if is_auxiliary_target and not is_draft_worker:
+        # B's target-verify graph uses the fixed inner width. Keeping B
+        # prefill eager avoids capturing an unrelated graph and reduces
+        # startup memory pressure.
+        return (capture_decode_cuda_graph if b_enabled else False), False
+
+    if is_draft_worker:
+        return (
+            (capture_decode_cuda_graph if a_enabled else False),
+            (capture_prefill_cuda_graph if a_enabled else False),
+        )
+
+    if c_enabled:
+        # C's outer TARGET_VERIFY uses the decode graph runner with width K*L.
+        # Keep prefill eager: only the fixed outer verify contract is enabled.
+        return capture_decode_cuda_graph, False
+
+    logger.info("HierarchicalSpec C target CUDA Graphs remain disabled")
+    return False, False
+
+
+def resolve_hierarchical_b_only_graph_flags(
+    *,
+    is_hierarchical: bool,
+    is_auxiliary_target: bool,
+    is_draft_worker: bool,
+    capture_decode_cuda_graph: bool,
+    capture_prefill_cuda_graph: bool = True,
+) -> tuple[bool, bool]:
+    """Backward-compatible alias for the role-aware graph resolver."""
+    return resolve_hierarchical_graph_flags(
+        is_hierarchical=is_hierarchical,
+        is_auxiliary_target=is_auxiliary_target,
+        is_draft_worker=is_draft_worker,
+        capture_decode_cuda_graph=capture_decode_cuda_graph,
+        capture_prefill_cuda_graph=capture_prefill_cuda_graph,
+    )
+
+
 def _align_pipeline_layers(layers: list, layer_model) -> list:
     has_start_layer = hasattr(layer_model, "start_layer")
     has_end_layer = hasattr(layer_model, "end_layer")
@@ -392,6 +457,7 @@ def capture_cuda_graphs(
     *,
     model_runner: ModelRunner,
     capture_decode_cuda_graph: bool = True,
+    capture_prefill_cuda_graph: bool = True,
     finalize: bool = True,
     defer_distributed_setup: bool = False,
 ) -> CudaGraphsCapture:
@@ -422,7 +488,9 @@ def capture_cuda_graphs(
     # eager buffer allocated above. (capture_prefill_graph routes prefill
     # to the eager runner when the prefill graph is disabled.)
     prefill = capture_prefill_graph(
-        model_runner=model_runner, eager_runner=eager_runner
+        model_runner=model_runner,
+        eager_runner=eager_runner,
+        capture_prefill_cuda_graph=capture_prefill_cuda_graph,
     )
 
     decode_phase = "draft_decode" if model_runner.is_draft_worker else "decode"
@@ -474,6 +542,7 @@ def capture_prefill_graph(
     model_runner: ModelRunner,
     eager_runner: EagerRunner,
     force_for_draft_worker: bool = False,
+    capture_prefill_cuda_graph: bool = True,
 ) -> GraphCapture:
     """Initialize a prefill graph and return its startup resource usage."""
 
@@ -491,6 +560,15 @@ def capture_prefill_graph(
             memory_usage_gb=memory_usage_gb,
             capture_time=capture_time,
         )
+
+    if not capture_prefill_cuda_graph:
+        logger.info(
+            "Disable prefill CUDA graph for %s by the caller.",
+            role,
+        )
+        if not model_runner.is_draft_worker:
+            return result(eager_runner)
+        return result(None)
 
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(

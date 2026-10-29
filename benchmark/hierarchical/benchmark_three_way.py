@@ -30,8 +30,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 DEFAULT_TASKS = (
-    "gsm8k:128,math500:128,humaneval:164,mbpp:128,"
-    "livecodebench:128,alpaca:128"
+    "gsm8k:128,math500:128,humaneval:164,mbpp:128,livecodebench:128,alpaca:128"
 )
 DEFAULT_TARGET = (
     "/mnt/workspace/lijiasheng/huggingface/hub/models--Qwen--Qwen3-4B/"
@@ -108,7 +107,11 @@ def _load_task_dataset(name: str):
     if name == "alpaca":
         ds = load_dataset("tatsu-lab/alpaca", split="train")
         return [
-            (f"{x['instruction']}\n\nInput:\n{x['input']}" if x["input"] else x["instruction"])
+            (
+                f"{x['instruction']}\n\nInput:\n{x['input']}"
+                if x["input"]
+                else x["instruction"]
+            )
             for x in ds
         ]
     if name == "mt-bench":
@@ -136,7 +139,10 @@ def _load_task_dataset(name: str):
         ]
     if name == "livecodebench":
         base = "https://huggingface.co/datasets/livecodebench/code_generation_lite/resolve/main/"
-        files = [base + f"test{i}.jsonl" if i > 1 else base + "test.jsonl" for i in range(1, 7)]
+        files = [
+            base + f"test{i}.jsonl" if i > 1 else base + "test.jsonl"
+            for i in range(1, 7)
+        ]
         ds = load_dataset("json", data_files={"test": files})["test"]
 
         def format_lcb(x: dict[str, Any]) -> str:
@@ -170,7 +176,9 @@ def build_prompts(name: str, tokenizer: AutoTokenizer, required: int) -> list[st
     if not raw:
         raise RuntimeError(f"Dataset {name!r} is empty")
     if len(raw) < required:
-        print(f"Warning: dataset={name} has {len(raw)} items, need {required}; cycling prompts")
+        print(
+            f"Warning: dataset={name} has {len(raw)} items, need {required}; cycling prompts"
+        )
     prompts = []
     for content in raw[:required]:
         prompts.append(
@@ -221,7 +229,17 @@ def find_port(base: int = 20000) -> int:
 def launch_server(model: str, url: str, args: list[str], timeout: int):
     host_port = url.removeprefix("http://")
     host, port = host_port.rsplit(":", 1)
-    command = ["sglang", "serve", "--model-path", model, *args, "--host", host, "--port", port]
+    command = [
+        "sglang",
+        "serve",
+        "--model-path",
+        model,
+        *args,
+        "--host",
+        host,
+        "--port",
+        port,
+    ]
     print(f"Server command: {shlex.join(command)}")
     proc = subprocess.Popen(command, env=os.environ.copy(), start_new_session=True)
     deadline = time.time() + timeout
@@ -321,7 +339,9 @@ def run_requests(
         if batch:
             results = generate(url, items, token_count, timeout_s, *params)
             if not isinstance(results, list) or len(results) != len(items):
-                raise RuntimeError("Batched /generate returned an unexpected result count")
+                raise RuntimeError(
+                    "Batched /generate returned an unexpected result count"
+                )
             return results
         with ThreadPoolExecutor(max_workers=max(concurrency, 1)) as pool:
             futures = [
@@ -335,7 +355,9 @@ def run_requests(
     if warmup_n and len(prompts) > warmup_n:
         for start in range(0, warmup_n, bs if batch_requests else warmup_n):
             issue(
-                prompts[start : min(start + (bs if batch_requests else warmup_n), warmup_n)],
+                prompts[
+                    start : min(start + (bs if batch_requests else warmup_n), warmup_n)
+                ],
                 warmup_max_new_tokens or max_new_tokens,
                 batch_requests,
             )
@@ -401,8 +423,28 @@ def server_args(args: argparse.Namespace, mode: str) -> list[str]:
     ]
     if args.disable_radix_cache:
         result.append("--disable-radix-cache")
-    if args.disable_cuda_graph or mode == "abc":
-        result.extend(["--cuda-graph-backend-decode", "disabled", "--cuda-graph-backend-prefill", "disabled"])
+    # Historically the ABC benchmark disabled CUDA graphs unconditionally so
+    # that the eager hierarchical path could be measured.  Keep that default,
+    # but allow explicit HierarchicalSpec role-graph experiments to opt back in
+    # through the role-specific environment variables exported by
+    # run_sglang_benchmark.sh.
+    hierarchical_graph_enabled = any(
+        os.environ.get(name, "0") == "1"
+        for name in (
+            "SGLANG_ENABLE_HIERARCHICAL_A_CUDA_GRAPH",
+            "SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH",
+            "SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH",
+        )
+    )
+    if args.disable_cuda_graph or (mode == "abc" and not hierarchical_graph_enabled):
+        result.extend(
+            [
+                "--cuda-graph-backend-decode",
+                "disabled",
+                "--cuda-graph-backend-prefill",
+                "disabled",
+            ]
+        )
     else:
         result.extend(
             [
@@ -414,13 +456,23 @@ def server_args(args: argparse.Namespace, mode: str) -> list[str]:
         )
     if mode == "ac":
         result.extend(
-            ["--speculative-algorithm", "DFLASH", "--speculative-draft-model-path", args.draft_model]
+            [
+                "--speculative-algorithm",
+                "DFLASH",
+                "--speculative-draft-model-path",
+                args.draft_model,
+            ]
         )
         if args.dflash_block_size is not None:
-            result.extend(["--speculative-dflash-block-size", str(args.dflash_block_size)])
+            result.extend(
+                ["--speculative-dflash-block-size", str(args.dflash_block_size)]
+            )
         if args.speculative_draft_model_quantization:
             result.extend(
-                ["--speculative-draft-model-quantization", args.speculative_draft_model_quantization]
+                [
+                    "--speculative-draft-model-quantization",
+                    args.speculative_draft_model_quantization,
+                ]
             )
     elif mode == "abc":
         result.extend(
@@ -439,11 +491,17 @@ def server_args(args: argparse.Namespace, mode: str) -> list[str]:
         )
         if args.speculative_draft_model_quantization:
             result.extend(
-                ["--speculative-draft-model-quantization", args.speculative_draft_model_quantization]
+                [
+                    "--speculative-draft-model-quantization",
+                    args.speculative_draft_model_quantization,
+                ]
             )
         if args.intermediate_model_quantization:
             result.extend(
-                ["--speculative-intermediate-quantization", args.intermediate_model_quantization]
+                [
+                    "--speculative-intermediate-quantization",
+                    args.intermediate_model_quantization,
+                ]
             )
     return result
 
@@ -461,7 +519,11 @@ def write_mode_report(
     concurrencies: list[int],
     results: dict[tuple[str, int], BenchMetrics],
 ) -> None:
-    title = {"abc": "A+B+C HierarchicalSpec", "c": "C-only baseline", "ac": "A+C DFlash"}[mode]
+    title = {
+        "abc": "A+B+C HierarchicalSpec",
+        "c": "C-only baseline",
+        "ac": "A+C DFlash",
+    }[mode]
     rows = []
     for dataset, count in tasks:
         for concurrency in concurrencies:
@@ -476,14 +538,20 @@ def write_mode_report(
                     "concurrency": concurrency,
                     "target_model": args.target_model,
                     "draft_model": args.draft_model if mode != "c" else None,
-                    "intermediate_model": args.intermediate_model if mode == "abc" else None,
+                    "intermediate_model": args.intermediate_model
+                    if mode == "abc"
+                    else None,
                     "intermediate_model_quantization": (
                         args.intermediate_model_quantization if mode == "abc" else None
                     ),
                     "cascade_rounds": args.cascade_rounds if mode == "abc" else None,
-                    "dflash_block_size": args.dflash_block_size if mode != "c" else None,
+                    "dflash_block_size": args.dflash_block_size
+                    if mode != "c"
+                    else None,
                     "dtype": args.dtype,
-                    "attention_backend": "flashinfer" if mode == "abc" else args.attention_backend,
+                    "attention_backend": "flashinfer"
+                    if mode == "abc"
+                    else args.attention_backend,
                     "tp_size": args.tp_size,
                     "temperature": args.temperature,
                     "top_p": args.top_p,
@@ -493,7 +561,10 @@ def write_mode_report(
                 }
             )
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows), encoding="utf-8")
+    path.write_text(
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        encoding="utf-8",
+    )
     md = [
         f"# {title} multi-task benchmark",
         "",
@@ -520,7 +591,11 @@ def write_mode_report(
 
 def summarize_three_way(out_dir: Path) -> None:
     groups: dict[str, dict[tuple[str, int], dict[str, Any]]] = {}
-    for name, file_name in (("abc", "abc_hierarchical.jsonl"), ("c", "c_only.jsonl"), ("ac", "ac_dflash.jsonl")):
+    for name, file_name in (
+        ("abc", "abc_hierarchical.jsonl"),
+        ("c", "c_only.jsonl"),
+        ("ac", "ac_dflash.jsonl"),
+    ):
         rows = {}
         with (out_dir / file_name).open(encoding="utf-8") as source:
             for line in source:
@@ -530,11 +605,19 @@ def summarize_three_way(out_dir: Path) -> None:
     expected = set(groups["c"])
     for name, rows in groups.items():
         if set(rows) != expected:
-            raise ValueError(f"Rows differ for {name}: missing={expected - set(rows)}, extra={set(rows) - expected}")
+            raise ValueError(
+                f"Rows differ for {name}: missing={expected - set(rows)}, extra={set(rows) - expected}"
+            )
     comparisons = []
     for dataset, concurrency in sorted(expected):
-        abc, c, ac = groups["abc"][(dataset, concurrency)], groups["c"][(dataset, concurrency)], groups["ac"][(dataset, concurrency)]
-        c_tps, ac_tps, abc_tps = (float(row["output_toks_per_s"]) for row in (c, ac, abc))
+        abc, c, ac = (
+            groups["abc"][(dataset, concurrency)],
+            groups["c"][(dataset, concurrency)],
+            groups["ac"][(dataset, concurrency)],
+        )
+        c_tps, ac_tps, abc_tps = (
+            float(row["output_toks_per_s"]) for row in (c, ac, abc)
+        )
         comparisons.append(
             {
                 "dataset": dataset,
@@ -556,7 +639,8 @@ def summarize_three_way(out_dir: Path) -> None:
             }
         )
     (out_dir / "comparison.jsonl").write_text(
-        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in comparisons), encoding="utf-8"
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in comparisons),
+        encoding="utf-8",
     )
     md = [
         "# A+B+C vs C vs A+C",
@@ -630,7 +714,9 @@ def main() -> None:
         args.intermediate_model_quantization = None
 
     if args.temperature != 0 or args.top_k != 1:
-        parser.error("HierarchicalSpec v1 benchmark requires greedy decoding: temperature=0 and top_k=1")
+        parser.error(
+            "HierarchicalSpec v1 benchmark requires greedy decoding: temperature=0 and top_k=1"
+        )
     if args.cascade_rounds <= 0 or args.dflash_block_size <= 0:
         parser.error("--cascade-rounds and --dflash-block-size must be positive")
     if not torch.cuda.is_available():
@@ -641,13 +727,23 @@ def main() -> None:
     if not concurrencies or min(concurrencies) < 1:
         raise ValueError("--concurrencies must contain positive integers")
     if args.output_dir is None:
-        args.output_dir = Path(__file__).resolve().parent / "outputs" / time.strftime("three_way_%Y%m%d_%H%M%S")
+        args.output_dir = (
+            Path(__file__).resolve().parent
+            / "outputs"
+            / time.strftime("three_way_%Y%m%d_%H%M%S")
+        )
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.target_model, trust_remote_code=True)
-    required_count = max(count for _, count in tasks) + args.warmup_requests * max(concurrencies) + args.skip_first_requests
+    required_count = (
+        max(count for _, count in tasks)
+        + args.warmup_requests * max(concurrencies)
+        + args.skip_first_requests
+    )
     print("Loading and formatting all benchmark prompts...")
-    prompts_by_task = {name: build_prompts(name, tokenizer, required_count) for name, _ in tasks}
+    prompts_by_task = {
+        name: build_prompts(name, tokenizer, required_count) for name, _ in tasks
+    }
 
     for mode in modes:
         output_name = MODE_OUTPUT_NAMES[mode]
@@ -658,7 +754,15 @@ def main() -> None:
         proc = launch_server(args.target_model, url, cmd_args, SERVER_START_TIMEOUT_S)
         results: dict[tuple[str, int], BenchMetrics] = {}
         try:
-            generate(url, "Hello", 8, min(args.timeout_s, 300), args.temperature, args.top_p, args.top_k)
+            generate(
+                url,
+                "Hello",
+                8,
+                min(args.timeout_s, 300),
+                args.temperature,
+                args.top_p,
+                args.top_k,
+            )
             for dataset, count in tasks:
                 for concurrency in concurrencies:
                     flush_cache(url)

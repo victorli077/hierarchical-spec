@@ -28,6 +28,45 @@ def cascade_verify_width(inner_block_size: int, rounds: int) -> int:
     return 1 + cascade_pending_width(inner_block_size, rounds)
 
 
+def hierarchical_model_verify_width(
+    *,
+    inner_block_size: int,
+    rounds: int,
+    is_auxiliary_target: bool,
+    is_draft_worker: bool,
+) -> int:
+    """Return the fixed Graph width owned by one hierarchical model runner."""
+    if is_auxiliary_target or is_draft_worker:
+        return inner_block_size
+    return cascade_verify_width(inner_block_size, rounds)
+
+
+def hierarchical_b_uses_dynamic_verify_plan(
+    *, is_hierarchical: bool, is_auxiliary_target: bool, is_draft_worker: bool
+) -> bool:
+    """Whether a hierarchical B replay needs live lengths for its verify plan.
+
+    The B worker reserves the complete outer C window, so its host KV-length
+    mirror is an allocation upper bound rather than the current inner-round
+    verify length. Its FlashInfer fast plan must instead use the live device
+    prefix plus the fixed B verify width.
+    """
+    return is_hierarchical and is_auxiliary_target and not is_draft_worker
+
+
+def hierarchical_uses_dynamic_verify_plan(
+    *, is_hierarchical: bool, is_auxiliary_target: bool, is_draft_worker: bool
+) -> bool:
+    """Whether a Hierarchical A/B replay must plan from live prefix lengths.
+
+    Both A (the DFlash draft worker) and B (the auxiliary target) can carry
+    an outer-window allocation bound in their host mirror. Their Graph fast
+    plans must instead use the committed device prefix plus the fixed inner
+    query width. C has its own outer verify layout and remains eager.
+    """
+    return is_hierarchical and (is_draft_worker or is_auxiliary_target)
+
+
 def validate_hierarchical_request(req: Any) -> str | None:
     """Return an admission error for features outside the v1 contract.
 

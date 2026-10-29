@@ -47,6 +47,9 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.speculative.hierarchical_config import (
+    hierarchical_uses_dynamic_verify_plan,
+)
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
@@ -67,6 +70,40 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 logger = logging.getLogger(__name__)
+
+
+def _hierarchical_uses_dynamic_verify_plan(model_runner) -> bool:
+    """Use live rather than allocation-bound lengths for Hierarchical A/B."""
+    return hierarchical_uses_dynamic_verify_plan(
+        is_hierarchical=model_runner.spec_algorithm.is_hierarchical(),
+        is_auxiliary_target=model_runner.is_auxiliary_target,
+        is_draft_worker=model_runner.is_draft_worker,
+    )
+
+
+def _resolve_fast_verify_host_lens(
+    *,
+    paged_kernel_lens: torch.Tensor,
+    seq_lens_cpu: Optional[torch.Tensor],
+    num_tokens_per_req: int,
+    hierarchical_dynamic: bool,
+) -> torch.Tensor:
+    """Return exact KV lengths for the sync-free FlashInfer verify plan.
+
+    Hierarchical A/B CPU sequence mirrors may be allocation upper bounds. Their
+    live device prefix plus the fixed verify width is the only valid plan
+    length; ordinary DFlash callers already provide an exact host mirror.
+    """
+    if hierarchical_dynamic:
+        return paged_kernel_lens.to(device="cpu", dtype=torch.int32) + int(
+            num_tokens_per_req
+        )
+    if seq_lens_cpu is None:
+        raise AssertionError(
+            "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
+        )
+    return seq_lens_cpu.to(torch.int32)
+
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     torch._logging.set_logs(dynamo=logging.ERROR)
@@ -334,6 +371,20 @@ class FlashInferAttnBackend(AttentionBackend):
         super().__init__()
         self.prefill_backend = "fa2"
         self.decode_backend = "fa2"
+        # Cache this role predicate at construction time.  The attention
+        # backend is intentionally not coupled to the ModelRunner object, but
+        # the Hierarchical A/B verify paths need a small capture-time policy
+        # override.  Keeping only the immutable boolean also avoids retaining
+        # a runner reference from every backend instance.
+        self._uses_hierarchical_dynamic_verify_plan = (
+            _hierarchical_uses_dynamic_verify_plan(model_runner)
+        )
+
+        if self._uses_hierarchical_dynamic_verify_plan:
+            logger.info(
+                "HierarchicalSpec A/B: use live seq_lens for FlashInfer fast "
+                "verify plan; preserve CUDA Graph replay without allocation-bound KV lengths."
+            )
 
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -1880,6 +1931,14 @@ class FlashInferIndicesUpdaterDecode:
 class FlashInferIndicesUpdaterPrefill:
     def __init__(self, model_runner: ModelRunner, attn_backend: FlashInferAttnBackend):
         # Parse Constants
+        # Keep the capture/replay policy on the updater as well as on the
+        # backend.  ``call_begin_forward`` is invoked through this object
+        # during CUDA-graph replay, so reading the backend attribute directly
+        # would otherwise depend on an implementation detail and leave the
+        # updater without the field entirely.
+        self._uses_hierarchical_dynamic_verify_plan = bool(
+            getattr(attn_backend, "_uses_hierarchical_dynamic_verify_plan", False)
+        )
         # Plan with the max per-layer head count: FlashInfer bakes num_qo_heads
         # into the plan, and layers running more heads than planned are
         # silently corrupted. Over-planning is safe.
@@ -2344,9 +2403,11 @@ class FlashInferIndicesUpdaterPrefill:
                 "on custom_mask."
             )
 
-        # fast_prefill_plan (installed at capture) is sync-free: it needs the
-        # host-known qo/kv layout from the caller. Assert rather than silently
-        # fall back to plan()'s blocking D2H on the replay hot-path.
+        # fast_prefill_plan (installed at capture) normally uses a host-known
+        # qo/kv layout. Hierarchical A/B are the exception: their live prefixes are
+        # copied once from the device below because its host mirror is only an
+        # allocation bound. Do not silently fall back to plan(), which also
+        # copies page metadata and rebuilds the planner state.
         paged_plan_kwargs = {}
         num_tokens_per_req = (
             spec_info.num_tokens_per_req if spec_info is not None else None
@@ -2356,13 +2417,30 @@ class FlashInferIndicesUpdaterPrefill:
             and wrapper_paged.begin_forward.func is fast_prefill_plan
         )
         if uses_fast_prefill:
-            assert seq_lens_cpu is not None, (
-                "fast_prefill_plan replay requires host-known seq_lens_cpu (got None)"
-            )
             assert num_tokens_per_req is not None and num_tokens_per_req > 0, (
                 f"fast_prefill_plan replay requires num_tokens_per_req > 0 (got {num_tokens_per_req})"
             )
-            seq_lens_cpu_i32 = seq_lens_cpu.to(torch.int32)
+            if self._uses_hierarchical_dynamic_verify_plan:
+                # Hierarchical A/B may reserve the complete outer window, so its
+                # ``seq_lens_cpu`` is deliberately an allocation bound (and
+                # may be None on the B batch), not the current verify length.
+                # The device ``paged_kernel_lens`` is the live committed
+                # prefix. Read that exact prefix once to host and add the
+                # fixed inner query width; this retains the fast FlashInfer plan
+                # path without planning attention over uncommitted KV.
+                seq_lens_cpu_i32 = _resolve_fast_verify_host_lens(
+                    paged_kernel_lens=paged_kernel_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    num_tokens_per_req=num_tokens_per_req,
+                    hierarchical_dynamic=True,
+                )
+            else:
+                seq_lens_cpu_i32 = _resolve_fast_verify_host_lens(
+                    paged_kernel_lens=paged_kernel_lens,
+                    seq_lens_cpu=seq_lens_cpu,
+                    num_tokens_per_req=num_tokens_per_req,
+                    hierarchical_dynamic=False,
+                )
             eagle_verify = spec_info.spec_input_type == SpecInputType.EAGLE_VERIFY
             assert use_custom_mask is None or eagle_verify
             if eagle_verify:

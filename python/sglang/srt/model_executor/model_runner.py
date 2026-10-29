@@ -140,6 +140,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
     resolve_elastic_cuda_graph_config,
+    resolve_hierarchical_graph_flags,
     sync_elastic_cuda_graph_config,
     validate_elastic_cuda_graph_recapture,
 )
@@ -881,6 +882,34 @@ class ModelRunner:
     ) -> int:
         """Logits rows per decode batch slot."""
         if self.spec_algorithm.is_speculative():
+            # HierarchicalSpec has two target workers with different fixed
+            # verify widths: the auxiliary B target verifies one inner DFlash
+            # block (L), while the scheduler target C verifies the accumulated
+            # outer cascade window (K*L).  The enum-level resolver describes C;
+            # auxiliary workers must use the inner width for their own Graph
+            # capture and replay.
+            if self.spec_algorithm.is_hierarchical():
+                resolved_inner_width = get_spec().speculative_num_draft_tokens
+                if resolved_inner_width is None:
+                    raise RuntimeError(
+                        "HierarchicalSpec target worker requires a resolved "
+                        "speculative_num_draft_tokens"
+                    )
+                if self.is_auxiliary_target or self.is_draft_worker:
+                    # max_decode_logits_rows() may probe the widest outer C
+                    # configuration through num_draft_tokens; A/B must ignore
+                    # that probe and retain their fixed inner width L.
+                    return int(resolved_inner_width)
+                from sglang.srt.speculative.hierarchical_config import (
+                    hierarchical_model_verify_width,
+                )
+
+                return hierarchical_model_verify_width(
+                    inner_block_size=int(resolved_inner_width),
+                    rounds=int(get_spec().speculative_cascade_rounds),
+                    is_auxiliary_target=self.is_auxiliary_target,
+                    is_draft_worker=self.is_draft_worker,
+                )
             if self.spec_algorithm.is_dspark() and self.is_draft_worker:
                 from sglang.srt.speculative.dspark_components.dspark_config import (
                     get_dspark_sample_from_anchor,
@@ -1192,6 +1221,15 @@ class ModelRunner:
         #     )
 
         #     warmup_all_flashinfer_megamoe_layers(self.model)
+        capture_decode_cuda_graph, capture_prefill_cuda_graph = (
+            resolve_hierarchical_graph_flags(
+                is_hierarchical=self.spec_algorithm.is_hierarchical(),
+                is_auxiliary_target=self.is_auxiliary_target,
+                is_draft_worker=self.is_draft_worker,
+                capture_decode_cuda_graph=capture_decode_cuda_graph,
+            )
+        )
+
         is_scale_joiner = get_exec().moe.is_ep_scale_joiner and not self.is_draft_worker
         defer_decode_capture = (
             is_scale_joiner
@@ -1205,6 +1243,7 @@ class ModelRunner:
             capture_decode_cuda_graph=(
                 capture_decode_cuda_graph and not defer_decode_capture
             ),
+            capture_prefill_cuda_graph=capture_prefill_cuda_graph,
             finalize=not defer_decode_capture,
             defer_distributed_setup=defer_decode_capture,
         )

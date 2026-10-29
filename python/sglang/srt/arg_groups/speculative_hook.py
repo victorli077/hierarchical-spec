@@ -1327,23 +1327,42 @@ def _handle_hierarchical(server_args: ServerArgs) -> None:
             "support other attention backends.",
             cfg.attention_backend,
         )
-    from sglang.srt.model_executor.cuda_graph_config import Backend
+    # HierarchicalSpec keeps all graphs off by default. Explicit A/B/C role
+    # switches opt in to their independent fixed-width contracts.
+    hierarchical_graph_enabled = (
+        envs.SGLANG_ENABLE_HIERARCHICAL_A_CUDA_GRAPH.get()
+        or envs.SGLANG_ENABLE_HIERARCHICAL_B_CUDA_GRAPH.get()
+        or envs.SGLANG_ENABLE_HIERARCHICAL_C_CUDA_GRAPH.get()
+    )
+    if hierarchical_graph_enabled and cfg.device == "cuda":
+        logger.warning(
+            "HierarchicalSpec role CUDA Graph experiment enabled; "
+            "A/B/C are selected independently."
+        )
+        disable_graph_kwargs = {}
+    else:
+        if hierarchical_graph_enabled:
+            logger.warning(
+                "HierarchicalSpec role CUDA Graphs require CUDA; keeping graphs disabled."
+            )
+        from sglang.srt.model_executor.cuda_graph_config import Backend
 
-    cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
-    cuda_graph_config.decode.backend = Backend.DISABLED
-    cuda_graph_config.prefill.backend = Backend.DISABLED
+        cuda_graph_config = copy.deepcopy(cfg.cuda_graph_config)
+        cuda_graph_config.decode.backend = Backend.DISABLED
+        cuda_graph_config.prefill.backend = Backend.DISABLED
+        disable_graph_kwargs = {
+            "disable_cuda_graph": True,
+            "disable_decode_cuda_graph": True,
+            "disable_prefill_cuda_graph": True,
+            "cuda_graph_config": cuda_graph_config,
+        }
+
     declare_resolution(
         server_args,
         "_handle_hierarchical",
         speculative_num_steps=1,
         disable_overlap_schedule=True,
-        # A -> B uses the native DFlash width while B -> C uses the wider
-        # K*L verify shape. V1 deliberately stays eager until separate
-        # graph capture contracts exist for both runners.
-        disable_cuda_graph=True,
-        disable_decode_cuda_graph=True,
-        disable_prefill_cuda_graph=True,
-        cuda_graph_config=cuda_graph_config,
+        **disable_graph_kwargs,
         enable_mixed_chunk=False,
         speculative_eagle_topk=1,
         speculative_use_rejection_sampling=False,

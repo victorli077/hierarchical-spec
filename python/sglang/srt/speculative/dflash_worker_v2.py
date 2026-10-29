@@ -1,6 +1,8 @@
 import logging
 import math
 import os
+import time
+from collections import defaultdict
 from collections.abc import Callable
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
@@ -120,6 +122,147 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FusedKVMaterializeHelper = None
+
+
+class _DFlashCudaTimer:
+    """Record the A+C decode timeline with CUDA events.
+
+    This is intentionally local to DFlash rather than shared with
+    HierarchicalSpec: HierarchicalSpec embeds a DFlash worker for its A->B
+    rounds and must not emit one nested timing record per round.
+    """
+
+    def __init__(self, *, enabled: bool):
+        self.enabled = enabled
+        self.stage_names = [
+            "a_draft",
+            "c_verify_setup",
+            "c_model_verify",
+            "c_accept_postprocess",
+            "c_hidden_publish",
+            "c_result_finalize",
+        ]
+        self.events = (
+            [
+                torch.cuda.Event(enable_timing=True)
+                for _ in range(len(self.stage_names) + 1)
+            ]
+            if enabled
+            else []
+        )
+        self._next_stage = 0
+        self._wall_start = 0.0
+
+    def start(self) -> None:
+        if not self.enabled:
+            return
+        self._next_stage = 0
+        self._wall_start = time.perf_counter()
+        self.events[0].record()
+
+    def mark(self, stage_name: str) -> None:
+        if not self.enabled:
+            return
+        expected = self.stage_names[self._next_stage]
+        if stage_name != expected:
+            raise RuntimeError(
+                "DFlash A+C timing stage order mismatch: "
+                f"expected {expected!r}, got {stage_name!r}."
+            )
+        self._next_stage += 1
+        self.events[self._next_stage].record()
+
+    def finish(self) -> dict[str, float]:
+        if not self.enabled:
+            return {}
+        if self._next_stage != len(self.stage_names):
+            raise RuntimeError(
+                "DFlash A+C timing ended before every stage was marked: "
+                f"marked={self._next_stage}, expected={len(self.stage_names)}."
+            )
+        self.events[-1].synchronize()
+        wall_ms = (time.perf_counter() - self._wall_start) * 1000.0
+        result = {
+            name: self.events[index].elapsed_time(self.events[index + 1])
+            for index, name in enumerate(self.stage_names)
+        }
+        event_total_ms = sum(result.values())
+        total_ms = max(wall_ms, event_total_ms)
+        result["host_launch_sync_residual"] = max(total_ms - event_total_ms, 0.0)
+        result["total"] = total_ms
+        return result
+
+
+class _DFlashTimingReporter:
+    """Periodically log A+C timing averages and stage percentages."""
+
+    def __init__(self, *, enabled: bool, interval: int, stage_names: list[str]):
+        self.enabled = enabled
+        self.interval = max(int(interval), 1)
+        self.stage_names = [*stage_names, "host_launch_sync_residual"]
+        self._count = 0
+        self._totals: dict[str, float] = defaultdict(float)
+        self._a_graph_replays = 0
+        self._a_graph_fallbacks = 0
+        self._c_graph_replays = 0
+        self._c_graph_fallbacks = 0
+
+    def add(
+        self,
+        sample: dict[str, float],
+        *,
+        batch_size: int,
+        a_graph_replay: bool,
+        c_graph_replay: bool,
+    ) -> None:
+        if not self.enabled:
+            return
+        self._count += 1
+        self._a_graph_replays += int(a_graph_replay)
+        self._a_graph_fallbacks += int(not a_graph_replay)
+        self._c_graph_replays += int(c_graph_replay)
+        self._c_graph_fallbacks += int(not c_graph_replay)
+        for name in [*self.stage_names, "total"]:
+            self._totals[name] += float(sample.get(name, 0.0))
+        if self._count < self.interval:
+            return
+
+        total_ms = self._totals["total"] / self._count
+        parts = []
+        for name in self.stage_names:
+            avg_ms = self._totals[name] / self._count
+            share = 100.0 * avg_ms / total_ms if total_ms > 0 else 0.0
+            parts.append(f"{name}={avg_ms:.3f} ms ({share:.1f}%)")
+        a_ms = self._totals["a_draft"] / self._count
+        c_ms = (
+            sum(
+                self._totals[name] for name in self.stage_names if name.startswith("c_")
+            )
+            / self._count
+        )
+        logger.info(
+            "DFlash A+C timing: samples=%d, latest_bs=%d, avg_total=%.3f ms | %s | "
+            "a_total=%.3f ms (%.1f%%) | c_total=%.3f ms (%.1f%%) | "
+            "a_graph_replays=%d a_graph_fallbacks=%d | c_graph_replays=%d c_graph_fallbacks=%d",
+            self._count,
+            batch_size,
+            total_ms,
+            " | ".join(parts),
+            a_ms,
+            100.0 * a_ms / total_ms if total_ms > 0 else 0.0,
+            c_ms,
+            100.0 * c_ms / total_ms if total_ms > 0 else 0.0,
+            self._a_graph_replays,
+            self._a_graph_fallbacks,
+            self._c_graph_replays,
+            self._c_graph_fallbacks,
+        )
+        self._count = 0
+        self._totals.clear()
+        self._a_graph_replays = 0
+        self._a_graph_fallbacks = 0
+        self._c_graph_replays = 0
+        self._c_graph_fallbacks = 0
 
 
 def _get_fused_kv_materialize_helper():
@@ -392,6 +535,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         gpu_id: int,
         nccl_port: int,
         target_worker: TpModelWorker,
+        timing_enabled: bool | None = None,
     ):
         super().__init__()
 
@@ -406,6 +550,24 @@ class DFlashWorkerV2(BaseSpecWorker):
         self.draft_window_size: Optional[int] = get_spec().speculative_draft_window_size
         self.use_compact_draft_cache = self.draft_window_size is not None
         self.device = target_worker.device
+        # HierarchicalSpec injects this worker as its A->B kernel.  Its outer
+        # coordinator owns the timing timeline, so nested workers explicitly
+        # pass False; standalone DFlash (A+C) follows the environment switch.
+        if timing_enabled is None:
+            timing_enabled = bool(envs.SGLANG_LOG_HIERARCHICAL_TIMING.get())
+        self._timing_enabled = bool(timing_enabled)
+        self._decode_timer = _DFlashCudaTimer(enabled=self._timing_enabled)
+        self._timing_reporter = _DFlashTimingReporter(
+            enabled=self._timing_enabled,
+            interval=envs.SGLANG_LOG_HIERARCHICAL_TIMING_INTERVAL.get(),
+            stage_names=self._decode_timer.stage_names,
+        )
+        if self._timing_enabled:
+            logger.warning(
+                "DFlash A+C CUDA timing is enabled (report interval=%d); "
+                "the end-of-decode synchronization adds profiling overhead.",
+                self._timing_reporter.interval,
+            )
 
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
@@ -2530,6 +2692,7 @@ class DFlashWorkerV2(BaseSpecWorker):
 
         bs = len(batch.seq_lens)
         device = self.device
+        self._decode_timer.start()
 
         # --- 1) Draft a fixed block with the draft model.
         target_model = self.target_worker.model_runner.model
@@ -2860,6 +3023,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         grammar_tree = (
             GrammarTree.from_linear_chain(draft_tokens) if batch.has_grammar else None
         )
+        if self._timing_enabled:
+            self._decode_timer.mark("a_draft")
         if on_draft_complete is not None:
             on_draft_complete()
 
@@ -2919,7 +3084,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
-
         # Idle-DP guard: an idle rank's eager verify contributes raw scheduler
         # counts while a graph-replaying rank assumes the padded bucket, so
         # their DP-gather segment offsets disagree. Fall back to eager verify
@@ -2937,6 +3101,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        self._decode_timer.mark("c_verify_setup")
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
@@ -2945,6 +3110,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 None if _is_npu or get_parallel().attn_dp_enabled else True
             ),
         )
+        self._decode_timer.mark("c_model_verify")
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
         target_predict = None
@@ -3032,6 +3198,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                 commit_lens=commit_lens,
             )
 
+        self._decode_timer.mark("c_accept_postprocess")
+
         if new_seq_lens is None:
             new_seq_lens = prefix_lens + commit_lens.to(prefix_lens.dtype)
         if on_publish is not None:
@@ -3064,7 +3232,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             new_seq_lens=new_seq_lens,
         )
 
-        return GenerationBatchResult(
+        self._decode_timer.mark("c_hidden_publish")
+
+        result = GenerationBatchResult(
             logits_output=logits_output,
             next_token_ids=out_tokens.reshape(-1),
             accept_lens=commit_lens,
@@ -3077,3 +3247,12 @@ class DFlashWorkerV2(BaseSpecWorker):
             routed_experts_output=target_out.routed_experts_output,
             indexer_topk_output=target_out.indexer_topk_output,
         )
+        self._decode_timer.mark("c_result_finalize")
+        timing_sample = self._decode_timer.finish()
+        self._timing_reporter.add(
+            timing_sample,
+            batch_size=bs,
+            a_graph_replay=bool(draft_out.can_run_graph),
+            c_graph_replay=bool(result.can_run_cuda_graph),
+        )
+        return result
